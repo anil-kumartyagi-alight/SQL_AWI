@@ -1,0 +1,620 @@
+--- loan detail
+
+WITH dc_loans
+AS (
+	SELECT a.global_client_id,
+		a.global_person_id,
+		a.platform_id,
+		a.platform_person_internal_id,
+		a.loan_subfund_id,
+		a.loan_effective_date,
+		a.begin_date,
+		a.plan_id,
+		a.end_date,
+		a.loan_category_id,
+		a.loan_amount,
+		a.total_loan_repayment_amount,
+		a.loan_payment_amount,
+		a.loan_status_code,
+		a.amortization_frequency_code,
+		a.actual_interest_rate_percent,
+		a.loan_duration_months,
+		a.loan_expected_end_date,
+		a.loan_status,
+		a.client_id
+	FROM wealth_rpt.dc_loans a
+	WHERE a.client_id = cast(<<$pClientId>> AS INT)
+		AND a.end_date >= TO_DATE((EXTRACT(YEAR FROM CURRENT_DATE) - 2) || '-01-01', 'YYYY-MM-DD')
+	),
+dc_loan_repayment
+AS (
+	SELECT b.global_client_id,
+		b.global_person_id,
+		b.platform_id,
+		b.platform_person_internal_id,
+		b.subfund_id,
+		b.loan_effective_date,
+		b.scheduled_loan_repayment_date,
+		b.activity_reference_number_id,
+		b.loan_repayment_type,
+		b.plan_id,
+		b.actual_payment_amount,
+		b.actual_interest_amount,
+		b.scheduled_loan_repayment_number,
+		b.actual_principal_amount,
+		b.remaining_principal_amount,
+		b.client_id
+	FROM wealth_rpt.dc_loan_repayment b
+	WHERE b.client_id = cast(<<$pClientId>> AS INT)
+		AND NOT (
+			b.scheduled_loan_repayment_date < TO_DATE((EXTRACT(YEAR FROM CURRENT_DATE) - 2) || '-01-01', 'YYYY-MM-DD')
+			AND b.loan_repayment_type = 'P'
+			)
+	),
+dc_person_loan_detail
+AS (
+	SELECT a.global_client_id,
+		a.global_person_id,
+		a.platform_id,
+		a.platform_person_internal_id,
+		a.loan_subfund_id,
+		a.loan_effective_date,
+		b.scheduled_loan_repayment_date,
+		b.activity_reference_number_id,
+		b.loan_repayment_type,
+		a.begin_date,
+		a.end_date,
+		a.plan_id,
+		a.client_id,
+		a.loan_category_id,
+		a.loan_amount,
+		a.total_loan_repayment_amount,
+		a.loan_payment_amount,
+		a.loan_status_code,
+		a.amortization_frequency_code,
+		a.actual_interest_rate_percent,
+		a.loan_duration_months,
+		a.loan_expected_end_date,
+		a.loan_status,
+		b.actual_payment_amount,
+		b.actual_interest_amount,
+		b.scheduled_loan_repayment_number,
+		b.actual_principal_amount,
+		b.remaining_principal_amount
+	FROM dc_loans a
+	LEFT OUTER JOIN dc_loan_repayment b ON--.global_client_id = b.global_client_id
+--AND a.global_person_id = b.global_person_id
+		 a.platform_id = b.platform_id
+		AND a.platform_person_internal_id = b.platform_person_internal_id
+		AND a.loan_subfund_id = b.subfund_id
+		AND a.loan_effective_date = b.loan_effective_date
+		AND a.plan_id = b.plan_id
+		AND a.client_id = b.client_id
+		AND b.scheduled_loan_repayment_date >= a.begin_date
+		AND b.scheduled_loan_repayment_date <= a.end_date
+	),
+Expression_effective_begin_date
+AS (
+	SELECT c.platform_id,
+		c.platform_person_internal_id,
+		c.loan_subfund_id,
+		c.loan_effective_date,
+		c.loan_category_id,
+		c.loan_amount,
+		c.begin_date AS BG_DT,
+		c.end_date,
+		c.loan_expected_end_date,
+		c.client_id
+	FROM dc_person_loan_detail c
+	),
+Expression_schedule_repayment_effective_date
+AS (
+	SELECT d.platform_id,
+		d.platform_person_internal_id,
+		d.loan_subfund_id,
+		d.loan_effective_date,
+		d.loan_category_id,
+		d.loan_amount,
+		d.scheduled_loan_repayment_date AS BG_DT,
+		d.end_date,
+		d.loan_expected_end_date,
+		d.client_id
+	FROM dc_person_loan_detail d
+	),
+combine_scdt_efdt
+AS (
+	SELECT e.platform_id,
+		e.platform_person_internal_id,
+		e.loan_subfund_id,
+		e.loan_effective_date,
+		e.loan_category_id,
+		e.loan_amount,
+		e.BG_DT,
+		e.end_date,
+		e.loan_expected_end_date,
+		e.client_id
+	FROM Expression_effective_begin_date e
+	
+	UNION ALL
+	
+	SELECT f.platform_id,
+		f.platform_person_internal_id,
+		f.loan_subfund_id,
+		f.loan_effective_date,
+		f.loan_category_id,
+		f.loan_amount,
+		f.BG_DT,
+		f.end_date,
+		f.loan_expected_end_date,
+		f.client_id
+	FROM Expression_schedule_repayment_effective_date f
+	),
+Expression
+AS (
+	SELECT g.platform_id,
+		g.platform_person_internal_id,
+		g.loan_subfund_id,
+		g.loan_effective_date,
+		g.loan_category_id,
+		g.loan_amount,
+		g.BG_DT,
+		g.end_date,
+		g.loan_expected_end_date,
+		g.client_id
+	FROM combine_scdt_efdt g
+	WHERE g.BG_DT IS NOT NULL
+	),
+combine
+AS (
+	SELECT h.platform_id,
+		h.platform_person_internal_id,
+		h.loan_subfund_id,
+		h.loan_effective_date,
+		h.loan_category_id,
+		h.loan_amount,
+		h.BG_DT,
+		h.end_date,
+		h.loan_expected_end_date,
+		h.client_id
+	FROM Expression h
+	GROUP BY h.platform_id,
+		h.platform_person_internal_id,
+		h.loan_subfund_id,
+		h.loan_effective_date,
+		h.loan_category_id,
+		h.loan_amount,
+		h.BG_DT,
+		h.end_date,
+		h.loan_expected_end_date,
+		h.client_id
+	ORDER BY h.BG_DT ASC
+	),
+exp_agg
+AS (
+	SELECT i.platform_id,
+		i.platform_person_internal_id,
+		i.loan_subfund_id,
+		i.loan_effective_date,
+		i.loan_category_id,
+		i.loan_amount,
+		i.BG_DT AS RPT_BGDT,
+		i.end_date,
+		i.loan_expected_end_date,
+		i.client_id
+	FROM combine i
+	),
+Adm_fact_END_BEG_FETCH
+AS (
+	SELECT j.platform_id,
+		j.platform_person_internal_id,
+		j.loan_subfund_id,
+		j.loan_effective_date,
+		j.loan_category_id,
+		j.loan_amount,
+		j.RPT_BGDT AS reporting_begin_date,
+		j.loan_expected_end_date,
+		j.client_id,
+		k.begin_date,
+		k.end_date
+	FROM exp_agg j
+	LEFT OUTER JOIN dc_loans k ON j.platform_id = k.platform_id
+		AND j.client_id = k.client_id
+		AND j.platform_person_internal_id = k.platform_person_internal_id
+		AND j.loan_subfund_id = k.loan_subfund_id
+		AND j.loan_effective_date = k.loan_effective_date
+		AND k.begin_date <= j.RPT_BGDT
+		AND k.end_date >= j.RPT_BGDT
+	),
+exp_RPT_END_DT
+AS (
+	SELECT l.platform_id,
+		l.platform_person_internal_id,
+		l.loan_subfund_id,
+		l.loan_effective_date,
+		l.loan_category_id,
+		l.loan_amount,
+		l.reporting_begin_date,
+		l.client_id,
+		l.begin_date,
+		l.end_date,
+		l.loan_expected_end_date,
+		CASE WHEN LEAD(l.reporting_begin_date, 1) OVER (
+					PARTITION BY l.client_id,
+					l.platform_person_internal_id,
+					l.platform_id,
+					l.loan_effective_date,
+					l.loan_subfund_id ORDER BY l.reporting_begin_date ASC
+					) IS NULL THEN CAST('2299-12-31' AS DATE) ELSE DATEADD(day, - 1, LEAD(l.reporting_begin_date, 1) OVER (
+						PARTITION BY l.client_id,
+						l.platform_person_internal_id,
+						l.platform_id,
+						l.loan_effective_date,
+						l.loan_subfund_id ORDER BY l.reporting_begin_date ASC
+						)) END AS reporting_end_date
+	FROM Adm_fact_END_BEG_FETCH l
+	),
+Join_FINAL_ADM
+AS (
+	SELECT n.global_client_id,
+		n.global_person_id,
+		m.platform_id,
+		m.client_id,
+		m.platform_person_internal_id,
+		m.loan_subfund_id,
+		m.loan_effective_date,
+		m.loan_category_id,
+		m.loan_amount,
+		m.reporting_begin_date,
+		m.reporting_end_date,
+		m.begin_date,
+		m.end_date,
+		m.loan_expected_end_date,
+		n.plan_id,
+		n.loan_duration_months,
+		n.total_loan_repayment_amount,
+		n.loan_payment_amount,
+		n.amortization_frequency_code,
+		n.actual_interest_rate_percent,
+		n.loan_status_code,
+		n.loan_status
+	FROM exp_RPT_END_DT m
+	LEFT OUTER JOIN dc_loans n ON m.platform_id = n.platform_id
+		AND m.client_id = n.client_id
+		AND m.platform_person_internal_id = n.platform_person_internal_id
+		AND m.loan_subfund_id = n.loan_subfund_id
+		AND m.loan_effective_date = n.loan_effective_date
+		AND m.begin_date = n.begin_date
+		AND m.reporting_end_date >= TO_DATE((EXTRACT(YEAR FROM CURRENT_DATE) - 2) || '-01-01', 'YYYY-MM-DD')
+	),
+Expression_prnc_bal
+AS (
+	SELECT platform_id AS platform_id,
+		a.client_id AS client_id,
+		a.plan_id,
+		a.begin_date AS reporting_begin_date,
+		a.end_date AS reporting_end_date,
+		CAST(closing_units AS DECIMAL(15, 2)) AS closing_unit_quantity,
+		a.subfund_id AS sub_fund,
+		a.fund_id,
+		a.platform_person_internal_id AS platform_person_internal_id
+	FROM wealth_rpt.dc_hard_balance a
+--	INNER JOIN (
+--		SELECT DISTINCT client_id,
+--			plan_identifier,
+--			fund_identifier,
+--			asset_class_identifier
+--		FROM wealth_rpt.dc_icb_fund_asset_mapping
+--		) b ON a.client_id = b.client_id
+--		AND a.plan_id = b.plan_identifier
+--		AND b.fund_identifier = a.fund_id
+	WHERE client_id IN (cast(<<$pClientId>> AS INT)) AND
+		--AND b.asset_class_identifier = 17
+		--AND end_date >= TO_DATE((EXTRACT(YEAR FROM CURRENT_DATE) - 2) || '-01-01', 'YYYY-MM-DD')
+		begin_date <= cast(dateadd(days, cast(floor(-1) as int), <<$pAsOfDate>>) as date) AND
+		end_date >= cast(dateadd(days, cast(floor(-1) as int), <<$pAsOfDate>>) as date) 
+	),
+Join_prnc_bal
+AS (
+	SELECT A.*,
+		ROUND(B.closing_unit_quantity, 2) AS remaining_principal_amount
+	FROM Join_FINAL_ADM A
+	LEFT OUTER JOIN Expression_prnc_bal B ON A.platform_id = B.platform_id
+		AND A.client_id = B.client_id
+		AND A.platform_person_internal_id = B.platform_person_internal_id
+		AND A.loan_subfund_id = B.sub_fund
+		AND A.reporting_begin_date >= B.reporting_begin_date
+		AND A.reporting_begin_date <= B.reporting_end_date
+	),
+Loan_CTE
+AS (
+	SELECT DISTINCT global_client_id,
+		global_person_id,
+		platform_id,
+		client_id,
+		platform_person_internal_id,
+		loan_subfund_id,
+		loan_effective_date,
+		loan_category_id,
+		loan_amount,
+		reporting_begin_date,
+		reporting_end_date,
+		begin_date,
+		end_date,
+		loan_expected_end_date,
+		plan_id,
+		loan_duration_months,
+		total_loan_repayment_amount,
+		loan_payment_amount,
+		amortization_frequency_code,
+		actual_interest_rate_percent,
+		loan_status_code,
+		loan_status,
+		SUM(remaining_principal_amount) OVER (
+			PARTITION BY platform_id,
+			client_id,
+			platform_person_internal_id,
+			loan_subfund_id,
+			loan_effective_date,
+			reporting_begin_date,
+			reporting_end_date
+			) AS remaining_principal_amount
+	FROM Join_prnc_bal
+	WHERE <<$pAsOfDate>> BETWEEN reporting_begin_date
+			AND reporting_end_date
+	),
+Person_CTE
+AS (
+	SELECT client_id,
+		client_id_string,
+		platform_person_internal_id,
+		platform_id,
+		last_name,
+		first_name,
+		middle_name,
+		gender,
+		birth_date,
+		person_reason_code,
+		union_name,
+		begin_date,
+		end_date
+	FROM person_rpt.person
+	WHERE client_id = cast(<<$pClientId>> AS INT)
+		AND person_reason_code = 'Employee'
+		AND <<$pAsOfDate>> BETWEEN begin_date
+			AND end_date
+	),
+psf
+AS (
+	SELECT *
+	FROM person_itg.person_security_filter
+	WHERE client_id = cast(<<$pClientId>> AS INT)
+	),
+pcf
+AS (
+	SELECT *
+	FROM person_itg.person_custom_filter
+	WHERE client_id = cast(<<$pClientId>> AS INT)
+		AND data_product = 'DC'
+	),
+Employment_CTE
+AS (
+	SELECT client_id,
+		platform_person_internal_id,
+		platform_id,
+		employee_id,
+		hire_date,
+		expected_annual_base_salary,
+		standard_employment_status,
+		standard_value AS employment_status,
+		termination_date,
+		employment_status_begin_date,
+		fulltime_parttime_status,
+		hourly_salary_status,
+		begin_date,
+		end_date
+	FROM person_rpt.person_employment p
+	LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+		ON p.standard_employment_status_code = rl.standard_key
+		AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+	WHERE client_id = cast(<<$pClientId>> AS INT)
+		AND <<$pAsOfDate>> BETWEEN begin_date
+			AND end_date
+	),
+Fund_CTE
+AS (
+	SELECT ROUND(SUM(T.closing_unit_quantity * T.daily_price), 2) AS Plan_Balance,
+		T.plan_id,
+		T.client_id,
+		T.platform_id,
+		T.platform_person_internal_id
+	FROM (
+		SELECT a.closing_unit_quantity,
+			a.plan_id,
+			a.client_id,
+			a.platform_id,
+			a.platform_person_internal_id,
+			b.daily_price
+		FROM Expression_prnc_bal a
+		INNER JOIN wealth_rpt.buysell_fund_prices b ON a.fund_id = b.fund_id
+		WHERE <<$pAsOfDate>> BETWEEN a.reporting_begin_date
+				AND a.reporting_end_date
+			AND b.effective_date = <<$pAsOfDate>>
+			AND b.client_id = cast(<<$pClientId>> AS INT)
+			AND a.client_id = cast(<<$pClientId>> AS INT)
+		) T
+	GROUP BY 
+		T.plan_id,
+		T.client_id,
+		T.platform_id,
+		T.platform_person_internal_id
+	)
+	,
+PlanStatus_CTE
+AS (
+	SELECT a.client_id,
+		a.platform_id,
+		a.plan_id,
+		a.platform_person_internal_id,
+		a.plan_status_description,
+		a.platform_indicator_code,
+		a.begin_date,
+		a.end_date,
+		b.category_id,
+		b.category_type_code,
+		b.category_definition_brand_code
+	FROM wealth_rpt.person_planstatus_dim a
+	INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+		AND a.category_id = b.category_id
+		AND a.plan_id = b.plan_id
+	WHERE a.platform_indicator_code IN ('R3', 'R4', 'DCE')
+		AND b.category_type_code = 'PS'
+		AND <<$pAsOfDate>> BETWEEN a.begin_date
+			AND a.end_date
+		AND b.category_definition_brand_code = 'PRTC-STAT'
+		AND a.client_id = cast(<<$pClientId>> AS INT)
+		AND b.client_id = cast(<<$pClientId>> AS INT)
+	),
+LoanDim_CTE
+AS (
+	SELECT client_id,
+		platform_id,
+		plan_id,
+		loan_subfund_id,
+		loan_category_id,
+		PLAN,
+		loan_subfund,
+		loan_category
+	FROM wealth_itg.dc_loan_dim
+	WHERE client_id = cast(<<$pClientId>> AS INT)
+	),
+Age_Range_CTE
+AS (
+	SELECT standard_group_key,
+		standard_min,
+		standard_max,
+		standard_display_name
+	FROM adlfound_itg.standard_ranges_lookup
+	WHERE standard_group_key = 'AGE_RANGE_DC'
+	),
+Tenure_Range_CTE
+AS (
+	SELECT standard_group_key,
+		standard_min,
+		standard_max,
+		standard_display_name
+	FROM adlfound_itg.standard_ranges_lookup
+	WHERE standard_group_key = 'TENURE'
+	),
+Salary_Range_CTE
+AS (
+	SELECT standard_group_key,
+		standard_min,
+		standard_max,
+		standard_display_name
+	FROM adlfound_itg.standard_ranges_lookup
+	WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+	),
+Main_Query
+AS (
+	SELECT person.client_id AS Client_ID,
+		person.client_id_string,
+		person.platform_id,
+		person.begin_date,
+		person.end_date,
+		person.platform_person_internal_id AS platform_person_internal_id,
+		employee.employee_id AS Employee_ID,
+		person.last_name AS Last_Name,
+		person.first_name AS First_Name,
+		person.middle_name AS Middle_Name,
+		person.gender AS Gender,
+		person.birth_date AS Birth_Date,
+		employee.hire_date AS Hire_Date,
+		employee.expected_annual_base_salary AS Salary,
+		FLOOR(DATEDIFF(day, person.birth_date, <<$pAsOfDate>>) / 365.25) AS Age,
+		
+		CASE 
+			WHEN person.person_reason_code = 'Employee' AND UPPER(employee.employment_status) = 'ACTIVE' 
+				THEN ROUND(DATEDIFF(DAY, employee.hire_date, <<$pAsOfDate>>) / 365.25, 2)
+			WHEN person.person_reason_code = 'Employee' AND UPPER(employee.employment_status) <> 'ACTIVE'
+				AND employee.termination_date IS NOT NULL AND EXTRACT(YEAR FROM employee.termination_date) <> 2299 
+				THEN ROUND(DATEDIFF(DAY, employee.hire_date, employee.termination_date) / 365.25, 2)
+			ELSE NULL 
+		END AS Tenure,
+		person.person_reason_code AS Person_Type,
+		employee.standard_employment_status AS Employment_Status,
+		employee.employment_status_begin_date AS Employment_Status_Begin_Date,
+		employee.fulltime_parttime_status AS FullTime_PartTime,
+		employee.hourly_salary_status AS Salary_Hourly,
+		person.union_name AS
+	
+	UNION
+		
+		,
+		round(fund.Plan_Balance) AS Plan_Balance,
+		loan_d.PLAN AS Plan_Name,
+		ppstat.plan_status_description AS Plan_Status,
+		loan_d.loan_subfund AS Loan_Subfund_Desc,
+		loans.loan_effective_date AS Loan_Effective_Date,
+		loans.loan_amount AS Loan_Origination_Amount,
+		loans.total_loan_repayment_amount AS Loan_Goal_Amount,
+		CASE WHEN loans.loan_status_code IN ('A', 'D', 'F', 'R') THEN loans.loan_payment_amount ELSE NULL END AS Loan_Repayment_Amount,
+		CASE loans.amortization_frequency_code WHEN 'B2' THEN 'Bi-Weekly' WHEN 'M' THEN 'Monthly' WHEN 'Q' THEN 'Quarterly' WHEN 'SM' THEN 'Semi-Monthly' WHEN 'W' THEN 'Weekly' ELSE NULL END AS Loan_Repayment_Frequency,
+		CASE WHEN loans.loan_status_code IN ('A', 'D', 'F', 'R') THEN loans.actual_interest_rate_percent ELSE NULL END AS Loan_Interest_Rate,
+		CASE WHEN loans.loan_status_code = 'T' THEN loans.remaining_principal_amount ELSE NULL END AS Remaining_Principle_Tax,
+		CASE WHEN loans.loan_status_code IN ('P', 'C', 'M', 'S') THEN 0 WHEN loans.loan_status_code IN ('A', 'D', 'F', 'R') THEN loans.remaining_principal_amount ELSE NULL END AS Remaining_Principle_Excl_Tax,
+		loans.remaining_principal_amount AS Remaining_Principal_Amount,
+		CASE WHEN fund.Plan_Balance <> 0 THEN (loans.remaining_principal_amount / fund.Plan_Balance) ELSE 0 END AS Loan_to_Balance_Ratio,
+		loans.loan_status AS Loan_Status,
+		loan_d.loan_category AS Loan_Category,
+		loans.loan_duration_months AS Loan_Term_Months,
+		loans.loan_expected_end_date AS Loan_End_Date,
+		psf.row_level_security_filter_value,
+		pcf.custom_filter_1,
+		pcf.custom_filter_2,
+		pcf.custom_filter_3,
+		pcf.custom_filter_4,
+		pcf.custom_filter_5
+	FROM Person_CTE person
+	LEFT JOIN psf ON person.platform_id = psf.platform_id
+		AND person.platform_person_internal_id = psf.platform_person_internal_id
+		AND person.client_id = psf.client_id
+	LEFT JOIN pcf ON person.platform_id = pcf.platform_id
+		AND person.platform_person_internal_id = pcf.platform_person_internal_id
+		AND person.client_id = pcf.client_id
+		AND <<$pAsOfDate>> BETWEEN pcf.begin_date
+			AND pcf.end_date
+	INNER JOIN Employment_CTE employee ON person.client_id = employee.client_id
+		AND person.platform_id = employee.platform_id
+		AND person.platform_person_internal_id = employee.platform_person_internal_id
+	INNER JOIN Fund_CTE fund ON person.client_id = fund.client_id
+		AND person.platform_id = fund.platform_id
+		AND person.platform_person_internal_id = fund.platform_person_internal_id
+	LEFT JOIN PlanStatus_CTE ppstat ON ppstat.client_id = fund.client_id
+		AND ppstat.platform_id = fund.platform_id
+		AND ppstat.plan_id = fund.plan_id
+		AND ppstat.platform_person_internal_id = fund.platform_person_internal_id
+	INNER JOIN Loan_CTE loans ON loans.client_id = fund.client_id
+		AND loans.platform_id = fund.platform_id
+		AND fund.plan_id = loans.plan_id
+		AND loans.platform_person_internal_id = fund.platform_person_internal_id
+	INNER JOIN LoanDim_CTE loan_d ON loans.client_id = loan_d.client_id
+		AND loans.platform_id = loan_d.platform_id
+		AND loans.plan_id = loan_d.plan_id
+		AND loans.loan_subfund_id = loan_d.loan_subfund_id
+		AND loans.loan_category_id = loan_d.loan_category_id
+	WHERE fund.client_id = cast(<<$pClientId>> AS INT)
+	),
+	
+	main as (
+SELECT Main_Query.*,
+	AGE_RG.standard_display_name AS Age_Range,
+	salary_rg.standard_display_name AS Salary_Range,
+	tenure_rg.standard_display_name AS Employment_Range
+FROM Main_Query
+LEFT JOIN Age_Range_CTE AGE_RG ON FLOOR(Main_Query.Age)BETWEEN (AGE_RG.standard_min)AND (AGE_RG.standard_max)
+LEFT JOIN Tenure_Range_CTE TENURE_RG ON FLOOR(Main_Query.Tenure)BETWEEN (TENURE_RG.standard_min)AND (TENURE_RG.standard_max)
+LEFT JOIN Salary_Range_CTE salary_rg ON FLOOR(Main_Query.Salary)BETWEEN (salary_rg.standard_min)AND (salary_rg.standard_max)
+WHERE Main_Query.Plan_Name IS NOT NULL
+)
+
+select * from main

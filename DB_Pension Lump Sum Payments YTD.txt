@@ -1,0 +1,82 @@
+---Hardcoded the date to DEC 2024 need to be changed while migrating to PROD
+
+WITH person_attributes
+AS (
+	SELECT DISTINCT global_client_id
+	,platform_id
+		,global_person_id
+		,client_id, client_id_string, row_level_security_filter_value
+		,platform_person_internal_id
+		, gender
+		,birth_date
+		,person_reason_code
+		,union_name
+	FROM person_rpt.person
+	WHERE 
+	--person_reason_code = 'Employee'AND 
+		
+		client_id = cast(<<$pClientId>> as int)
+		and 
+		(
+		(begin_date <= current_date
+		AND end_date >= current_date
+		AND cast(<<$pClientId>> as int) <> '00095' )
+		OR
+		
+		(last_day(begin_date) <= '2024-07-31'
+		AND last_day(end_date) >= '2024-07-31'
+		AND cast(<<$pClientId>> as int) = '00095' )
+		)
+		
+		
+		
+		
+		
+	)
+	
+, query_db_payments
+As (
+select distinct client_id,platform_id,  platform_person_internal_id  ,payment_effective_date,
+payment_adjustment_cd,payment_type,plan_id,plan,
+payment_id,payment_destination,sum(total_payment_amount)total_payment_amount,address_format_type_code
+from wealth_rpt.db_payments  where 
+client_id= cast(<<$pClientId>> as int) and 
+(
+(
+cast(<<$pClientId>> as int) <> '00095'  and 
+extract(year from payment_effective_date) = extract(year from current_date)
+and payment_effective_date <= current_date
+)
+OR
+(
+cast(<<$pClientId>> as int) = '00095'  and 
+extract(year from payment_effective_date) = 2024
+and payment_effective_date <= '2024-07-31'
+)
+
+)
+--between '2024-01-01' and '2024-12-31'
+and total_payment_amount>0.00 
+group by platform_person_internal_id  ,payment_effective_date,address_format_type_code,
+payment_id,payment_destination,payment_adjustment_cd,client_id,platform_id, payment_type,plan_id,plan
+)
+
+
+    SELECT
+        person_attributes.client_id, person_attributes.client_id_string, person_attributes.row_level_security_filter_value, 
+		-- ltrim(to_char(person_attributes.client_id,'99999')) as client_id_string,
+		query_db_payments.payment_type,
+		sum(query_db_payments.total_payment_amount) Payment_amount,
+		COUNT(query_db_payments.platform_person_internal_id) as Tot_ppt,
+        query_db_payments.plan_id,
+		query_db_payments.plan
+        from
+		query_db_payments inner join person_attributes  on
+		 query_db_payments.client_id = person_attributes.client_id
+		AND query_db_payments.platform_person_internal_id = person_attributes.platform_person_internal_id
+		AND query_db_payments.platform_id = person_attributes.platform_id
+		group by 
+		person_attributes.client_id, person_attributes.client_id_string, person_attributes.row_level_security_filter_value, 
+        query_db_payments.plan,
+        query_db_payments.payment_type,
+		query_db_payments.plan_id

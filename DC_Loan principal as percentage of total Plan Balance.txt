@@ -1,0 +1,309 @@
+WITH dc_loans AS
+  (SELECT a.global_client_id,
+          a.global_person_id,
+          a.platform_id,
+          a.platform_person_internal_id,
+          a.loan_subfund_id,
+          a.loan_effective_date,
+          a.begin_date,
+          a.end_date,
+          a.loan_status_code,
+          a.plan_id,
+          a.loan_category_id,
+          a.loan_amount,
+          a.client_id
+   FROM wealth_rpt.dc_loans a
+   WHERE a.client_id = <<$pClientId>> and a.end_date >= TO_DATE((EXTRACT(YEAR FROM CURRENT_DATE) - 2) || '-01-01', 'YYYY-MM-DD')),
+     dc_loan_repayment AS
+  (SELECT b.global_client_id,
+          b.global_person_id,
+          b.platform_id,
+          b.platform_person_internal_id,
+          b.subfund_id,
+          b.loan_effective_date,
+          b.scheduled_loan_repayment_date,
+          b.plan_id,
+          b.actual_principal_amount,
+          b.remaining_principal_amount,
+          b.client_id
+   FROM wealth_rpt.dc_loan_repayment b
+   WHERE b.client_id = <<$pClientId>> and NOT (b.scheduled_loan_repayment_date < TO_DATE((EXTRACT(YEAR FROM CURRENT_DATE) - 2) || '-01-01', 'YYYY-MM-DD') and b.loan_repayment_type = 'P') ),
+     dc_person_loan_detail AS
+  (SELECT a.global_client_id,
+          a.global_person_id,
+          a.platform_id,
+          a.platform_person_internal_id,
+          a.loan_subfund_id,
+          a.loan_effective_date,
+          b.scheduled_loan_repayment_date,
+          a.begin_date,
+          a.end_date,
+          a.plan_id,
+          a.client_id,
+          a.loan_category_id,
+          a.loan_amount,
+          b.actual_principal_amount,
+          b.remaining_principal_amount
+   FROM dc_loans a
+   LEFT JOIN dc_loan_repayment b ON a.global_client_id = b.global_client_id
+   AND a.global_person_id = b.global_person_id
+   AND a.platform_id = b.platform_id
+   AND a.platform_person_internal_id = b.platform_person_internal_id
+   AND a.loan_subfund_id = b.subfund_id
+   AND a.loan_effective_date = b.loan_effective_date
+   AND a.plan_id = b.plan_id
+   AND a.client_id = b.client_id
+   AND b.scheduled_loan_repayment_date >= a.begin_date
+   AND b.scheduled_loan_repayment_date <= a.end_date), 
+combine_scdt_efdt AS 
+  (SELECT platform_id, 
+          platform_person_internal_id, 
+          loan_subfund_id, 
+          loan_effective_date, 
+          loan_category_id, 
+          loan_amount, 
+          begin_date AS BG_DT, 
+          end_date, 
+          client_id 
+   FROM dc_person_loan_detail 
+   UNION ALL SELECT platform_id, 
+                    platform_person_internal_id, 
+                    loan_subfund_id, 
+                    loan_effective_date, 
+                    loan_category_id, 
+                    loan_amount, 
+                    scheduled_loan_repayment_date AS BG_DT, 
+                    end_date, 
+                    client_id 
+   FROM dc_person_loan_detail), 
+Expression AS 
+  (SELECT platform_id, 
+          platform_person_internal_id, 
+          loan_subfund_id, 
+          loan_effective_date, 
+          loan_category_id, 
+          loan_amount, 
+          BG_DT, 
+          end_date, 
+          client_id 
+   FROM combine_scdt_efdt 
+   WHERE BG_DT IS NOT NULL ), 
+combine AS 
+  (SELECT platform_id, 
+          platform_person_internal_id, 
+          loan_subfund_id, 
+          loan_effective_date, 
+          loan_category_id, 
+          loan_amount, 
+          BG_DT, 
+          end_date, 
+          client_id 
+   FROM Expression 
+   GROUP BY platform_id, 
+            platform_person_internal_id, 
+            loan_subfund_id, 
+            loan_effective_date, 
+            loan_category_id, 
+            loan_amount, 
+            BG_DT, 
+            end_date, 
+            client_id), 
+exp_agg AS 
+  (SELECT platform_id, 
+          platform_person_internal_id, 
+          loan_subfund_id, 
+          loan_effective_date, 
+          loan_category_id, 
+          loan_amount, 
+          BG_DT AS RPT_BGDT, 
+          end_date, 
+          client_id 
+   FROM combine), 
+Adm_fact_END_BEG_FETCH AS 
+  (SELECT j.platform_id, 
+          j.platform_person_internal_id, 
+          j.loan_subfund_id, 
+          j.loan_effective_date, 
+          j.loan_category_id, 
+          j.loan_amount, 
+          j.RPT_BGDT AS reporting_begin_date, 
+          j.client_id, 
+          k.begin_date, 
+          k.end_date 
+   FROM exp_agg j 
+   LEFT JOIN dc_loans k ON j.platform_id = k.platform_id 
+   AND j.client_id = k.client_id 
+   AND j.platform_person_internal_id = k.platform_person_internal_id 
+   AND j.loan_subfund_id = k.loan_subfund_id 
+   AND j.loan_effective_date = k.loan_effective_date 
+   AND k.begin_date <= j.RPT_BGDT 
+   AND k.end_date >= j.RPT_BGDT), 
+exp_RPT_END_DT AS 
+  (SELECT l.platform_id, 
+          l.platform_person_internal_id, 
+          l.loan_subfund_id, 
+          l.loan_effective_date, 
+          l.loan_category_id, 
+          l.loan_amount, 
+          l.reporting_begin_date, 
+          l.client_id, 
+          l.begin_date, 
+          l.end_date, 
+          LEAD(l.reporting_begin_date, 1) OVER (PARTITION BY l.client_id, 
+                                                             l.platform_person_internal_id, 
+                                                             l.platform_id, 
+                                                             l.loan_effective_date, 
+                                                             l.loan_subfund_id 
+                                                ORDER BY l.reporting_begin_date ASC) AS next_begin_date 
+   FROM Adm_fact_END_BEG_FETCH l), 
+exp_final_dates AS 
+  (SELECT *, 
+          COALESCE(DATEADD(DAY, -1, next_begin_date), CAST('2299-12-31' AS DATE)) AS reporting_end_date 
+   FROM exp_RPT_END_DT), 
+Join_FINAL_ADM AS 
+  (SELECT n.global_client_id, 
+          n.global_person_id, 
+          m.platform_id, 
+          m.client_id, 
+          m.platform_person_internal_id, 
+          m.loan_subfund_id, 
+          m.loan_effective_date, 
+          m.loan_category_id, 
+          m.loan_amount, 
+          m.reporting_begin_date, 
+          m.reporting_end_date, 
+          m.begin_date, 
+          m.end_date, 
+          n.plan_id, 
+          n.loan_status_code 
+   FROM exp_final_dates m 
+   LEFT JOIN dc_loans n ON m.platform_id = n.platform_id 
+   AND m.client_id = n.client_id 
+   AND m.platform_person_internal_id = n.platform_person_internal_id 
+   AND m.loan_subfund_id = n.loan_subfund_id 
+   AND m.loan_effective_date = n.loan_effective_date 
+   AND m.begin_date = n.begin_date 
+   WHERE m.reporting_end_date >= TO_DATE((EXTRACT(YEAR
+                                                  FROM CURRENT_DATE) - 2) || '-01-01', 'YYYY-MM-DD') ), 
+Expression_prnc_bal
+AS (
+	SELECT platform_id AS platform_id,
+		a.client_id AS client_id,
+		a.plan_id,
+		a.begin_date AS reporting_begin_date,
+		a.end_date AS reporting_end_date,
+		CAST(closing_units AS DECIMAL(15, 2)) AS closing_unit_quantity,
+		a.subfund_id AS sub_fund,
+		a.fund_id,
+		a.platform_person_internal_id AS platform_person_internal_id
+	FROM wealth_rpt.dc_hard_balance a
+	inner join (select distinct client_id,plan_identifier,fund_identifier,asset_class_identifier from wealth_rpt.dc_icb_fund_asset_mapping) b on a.client_id =b.client_id and a.plan_id=b.plan_identifier and b.fund_identifier=a.fund_id 
+	WHERE platform_id IN (<<$pClientId>>) and b.asset_class_identifier=17 and end_date >= TO_DATE((EXTRACT(YEAR FROM CURRENT_DATE) - 2) || '-01-01', 'YYYY-MM-DD')
+	), 
+Join_prnc_bal AS 
+  (SELECT A.platform_id, 
+          A.client_id, 
+          A.platform_person_internal_id, 
+          A.loan_subfund_id, 
+          A.loan_effective_date, 
+          A.loan_category_id, 
+          A.loan_amount, 
+          A.reporting_begin_date, 
+          A.reporting_end_date, 
+          ROUND(B.closing_unit_quantity, 2) AS remaining_principal_amount, 
+          A.loan_status_code 
+   FROM Join_FINAL_ADM A 
+   LEFT JOIN Expression_prnc_bal B ON A.platform_id = B.platform_id 
+   AND A.client_id = B.client_id 
+   AND A.platform_person_internal_id = B.platform_person_internal_id 
+   AND A.loan_subfund_id = B.sub_fund 
+   AND A.reporting_begin_date >= B.reporting_begin_date 
+   AND A.reporting_begin_date <= B.reporting_end_date), 
+Loan_CTE AS 
+  (SELECT DISTINCT platform_id, 
+                   client_id, 
+                   platform_person_internal_id, 
+                   loan_subfund_id, 
+                   loan_effective_date, 
+                   loan_category_id, 
+                   loan_amount, 
+                   reporting_begin_date, 
+                   reporting_end_date, 
+                   loan_status_code, 
+                   SUM(remaining_principal_amount) OVER (PARTITION BY platform_id, 
+                                                                      client_id, 
+                                                                      platform_person_internal_id, 
+                                                                      loan_subfund_id, 
+                                                                      loan_effective_date, 
+                                                                      reporting_begin_date, 
+                                                                      reporting_end_date) AS remaining_principal_amount 
+   FROM Join_prnc_bal), 
+input_dates AS 
+  (SELECT CAST('2024-12-31' AS DATE) AS as_of_date, 
+          DATEADD(YEAR, -1, CAST('2024-12-31' AS DATE)) AS previous_date), 
+unpivoted_dates AS 
+  (SELECT 'current' AS period, 
+          as_of_date AS calc_date
+   FROM input_dates 
+   UNION ALL SELECT 'previous', 
+                    previous_date
+   FROM input_dates), 
+Loan_Principal_Period AS 
+  (SELECT d.period, 
+          d.calc_date, 
+          l.client_id, 
+          l.platform_id, 
+          l.platform_person_internal_id, 
+          SUM(l.remaining_principal_amount) AS total_loan_principal 
+   FROM Loan_CTE l 
+   CROSS JOIN unpivoted_dates d 
+   WHERE l.loan_status_code = 'A'
+     AND d.calc_date BETWEEN l.reporting_begin_date AND l.reporting_end_date
+   GROUP BY d.period,
+            d.calc_date,
+            l.client_id,
+            l.platform_id,
+            l.platform_person_internal_id),
+Plan_Balance_Period AS
+  (SELECT d.period,
+          d.calc_date,
+          a.client_id,
+          a.platform_id,
+          a.platform_person_internal_id AS platform_person_internal_id,
+          SUM(ROUND(a.closing_units * b.daily_price, 2)) AS total_plan_balance
+   FROM wealth_rpt.dc_hard_balance a
+   JOIN wealth_rpt.buysell_fund_prices b ON a.fund_id = b.fund_id
+   CROSS JOIN unpivoted_dates d
+   WHERE d.calc_date BETWEEN a.begin_date AND a.end_date
+     AND b.effective_date = d.calc_date
+     AND a.client_id = <<$pClientId>>
+     AND b.client_id = <<$pClientId>>
+   GROUP BY d.period,
+            d.calc_date,
+            a.client_id,
+            a.platform_id,
+            a.platform_person_internal_id),
+Combined_Per_Person AS
+  (SELECT lp.client_id,
+          lp.platform_person_internal_id,
+          lp.period,
+          lp.calc_date,
+          ROUND(lp.total_loan_principal * 100.0 / NULLIF(pb.total_plan_balance, 0), 2) AS pct
+   FROM Loan_Principal_Period lp
+   JOIN Plan_Balance_Period pb ON lp.client_id = pb.client_id
+   AND lp.platform_id = pb.platform_id
+   AND lp.platform_person_internal_id = pb.platform_person_internal_id
+   AND lp.period = pb.period
+   AND lp.calc_date = pb.calc_date
+   WHERE pb.total_plan_balance > 0 ),
+Pivoted_Per_Client AS
+  (SELECT client_id,'' as client_id_string,
+          ROUND(AVG(pct), 2) AS loan_principal_percentage,
+          calc_date AS calculation_date
+   FROM Combined_Per_Person
+   GROUP BY client_id,
+            calc_date)
+SELECT *
+FROM Pivoted_Per_Client
+ORDER BY client_id,
+         calculation_date

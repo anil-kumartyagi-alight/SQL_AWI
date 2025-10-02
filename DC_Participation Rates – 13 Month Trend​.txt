@@ -1,0 +1,231 @@
+--begin_date = '2024-12-01'
+--end_date = '2024-12-31'
+
+WITH calendar 
+AS(
+	SELECT DISTINCT 
+		previous_month_begin_date as cal_begin_date
+		,previous_month_end_date as cal_end_date
+	FROM adlfound_itg.calendar 
+	WHERE previous_month_end_date BETWEEN CAST(DATEADD(MONTH,-12,'2024-12-31') AS DATE) AND CAST('2024-12-31' AS DATE) 
+	)
+	,mv_person_employment
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,platform_person_internal_id
+		,expected_annual_base_salary
+		,hourly_salary_status
+		,fulltime_parttime_status
+		,platform_id
+		--,employment_status
+		,begin_date
+		,end_date
+		,hire_date
+		,termination_date
+		,standard_value AS employment_status
+		,cal_end_date
+FROM person_rpt.person_employment pe
+CROSS JOIN calendar
+LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+	ON pe.standard_employment_status_code = rl.standard_key
+	AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+	WHERE 
+		begin_date <= cal_end_date
+		AND end_date >= cal_end_date
+		AND client_id =1638
+		AND UPPER(TRIM(standard_value)) = 'ACTIVE'
+	)
+	,PRSN_PLANSTAT_DIMN01
+AS (
+	SELECT a.client_id AS CLIENT_ID
+		,a.platform_person_internal_id AS PRSN_INTN_ID
+		,a.platform_id
+		,a.begin_date AS PP_STAT_EFBEG_DT
+		,a.plan_status_code AS PLAN_STAT_CD
+		,a.participation_status_code AS prtc_stat_cd
+		,a.plan_id AS PLAN_ID
+		,cal_end_date
+		,MAX(begin_date) OVER (
+			PARTITION BY a.client_id
+			,a.plan_id
+			,a.platform_person_internal_id
+			,a.category_id
+			,cal_end_date
+			) AS MAX_PP_STAT_EFBEG_DT
+	FROM wealth_rpt.person_planstatus_dim a
+	CROSS JOIN calendar
+	INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+		AND a.category_id = b.category_id
+		AND a.plan_id = b.plan_id
+	WHERE
+		a.platform_indicator_code IN ('R3','R4','DCE') 
+		AND b.category_type_code = 'PS'
+		AND cal_end_date >= a.begin_date
+		AND cal_end_date <= a.end_date
+		AND b.category_definition_brand_code = 'PRTC-STAT'
+		AND UPPER(participation_status_code) IN ('ACTIVE','ELIG')
+		AND a.client_id =1638
+	)
+	,PRSN_PLANSTAT_DIMN
+AS (
+	SELECT DISTINCT CLIENT_ID
+		,PLAN_ID
+		,platform_id
+		,PRSN_INTN_ID
+		,prtc_stat_cd
+		--,CAT_TYPE_CD
+		,MAX_PP_STAT_EFBEG_DT
+		,cal_end_date
+	FROM PRSN_PLANSTAT_DIMN01
+	WHERE MAX_PP_STAT_EFBEG_DT = PP_STAT_EFBEG_DT
+	)
+	,person_planstat
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+		,p.client_id
+		,p.platform_person_internal_id
+		,p.employment_status
+		,d.prtc_stat_cd
+		,d.plan_id
+		,d.cal_end_date
+	FROM prsn_planstat_dimn d
+	INNER JOIN mv_person_employment p ON p.client_id = d.client_id
+		AND p.platform_person_internal_id = d.prsn_intn_id
+		AND p.platform_id = d.platform_id
+	)
+	,dc_plan_dimn
+AS (
+	SELECT client_id
+		,plan_brand_code as plan_brnd_cd
+		,plan_long_description as plan_ldsc_tx
+		,plan_type_code as plan_type_cd
+		,plan_id
+	FROM wealth_rpt.dc_plan_dim
+	WHERE client_id =1638
+		AND plan_type_code = 'DC'
+	)
+	,person_data
+AS (
+	SELECT a.client_id
+		,a.platform_person_internal_id
+		,a.employment_status
+		,a.prtc_stat_cd
+		,a.plan_id
+		,b.plan_ldsc_tx
+		,a.cal_end_date as reporting_month
+	FROM person_planstat a
+	LEFT JOIN dc_plan_dimn b ON a.client_id = b.client_id
+		AND a.plan_id = b.plan_id
+	WHERE b.plan_type_cd = 'DC'
+	)
+	,dc_contributions
+AS (
+	SELECT 
+		client_id,
+		plan_id,
+		platform_person_internal_id,
+		contribution_rate_id,
+		contribution_rate_type_code,
+		cal_end_date,
+		actual_contribution_rate as actual_contribution_rate,
+		actual_contribution_amount AS actual_contribution_amount
+	FROM wealth_itg.dc_contributions
+		CROSS JOIN calendar
+	WHERE trim(contribution_rate_type_code) in ('RT','BT','AT')
+		AND begin_date <= cal_end_date
+		AND end_date >= cal_end_date
+	)
+	,dc_ccp_ctrb_id 
+AS (
+	SELECT c.client_id
+		,c.base_provision_type_id
+		,CAST(c.provision_key_value AS INT) AS provision_key_value
+		,ci.base_element_id
+		,ROW_NUMBER() OVER (PARTITION BY c.client_id) AS rn
+	FROM adlfound_itg.ccr_instance c
+	INNER JOIN adlfound_itg.ccr_instance_element ci ON c.client_id = ci.client_id
+		AND c.data_instance_id = ci.data_instance_id
+	WHERE c.client_id = 1638 --and c.base_provision_type_id=9000080
+		AND ci.base_element_id IN (106580,106570,106560)
+		AND trim(c.platform_indicator_code) IN ('R3','R4','DCE')
+	)
+	,dc_ccp_ctrb_id_uniq_client
+AS (
+	SELECT client_id
+	FROM dc_ccp_ctrb_id
+	WHERE rn = 1
+	)
+	,
+	--Use contribution id available in ccp table. If ccp data doesn't exist, use contributions directly from contribution table.
+	dc_contributions_ccp 
+AS (
+	(
+	SELECT c.*
+	FROM dc_contributions c
+	INNER JOIN dc_ccp_ctrb_id d_ccp ON c.client_id = d_ccp.client_id
+			AND c.contribution_rate_id = d_ccp.provision_key_value
+	)
+	UNION ALL
+	(
+	SELECT c.*
+	FROM dc_contributions c
+	WHERE NOT EXISTS (
+				SELECT 1
+				FROM dc_ccp_ctrb_id_uniq_client i
+				WHERE i.client_id = c.client_id
+				)
+		)
+	)
+	,dc_contributions_final
+AS (
+	SELECT 
+		client_id,
+		plan_id,
+		platform_person_internal_id,
+		--contribution_rate_id,
+		--contribution_rate_type_code,
+		cal_end_date,
+		SUM(actual_contribution_rate) as actual_contribution_rate,
+		SUM(actual_contribution_amount) AS actual_contribution_amount
+	FROM dc_contributions_ccp
+	GROUP BY 
+		client_id,
+		plan_id,
+		platform_person_internal_id,
+		cal_end_date
+	)
+	,join_person_contributions
+AS (
+	SELECT 
+		p.client_id
+		,p.platform_person_internal_id
+		,p.prtc_stat_cd
+		,P.employment_status
+		,p.plan_id
+		,p.plan_ldsc_tx
+		,p.reporting_month
+		,c.actual_contribution_rate
+		,c.actual_contribution_amount
+	FROM 
+		person_data p 
+		LEFT JOIN dc_contributions_final c 
+		ON p.client_id = c.client_id
+		AND p.plan_id = c.plan_id
+		AND p.platform_person_internal_id = c.platform_person_internal_id	
+		AND p.reporting_month = c.cal_end_date
+	)
+SELECT 
+	client_id
+	,reporting_month
+
+	--,COUNT(DISTINCT CASE WHEN prtc_stat_cd IN ('ACTIVE','ELIG') AND (actual_contribution_rate > 0 OR actual_contribution_amount>0) THEN platform_person_internal_id END) AS contributing_ppt
+	--,COUNT(DISTINCT CASE WHEN prtc_stat_cd IN ('ACTIVE','ELIG') AND UPPER(employment_status) = 'ACTIVE' THEN platform_person_internal_id END) AS tot_ppt
+	,CAST(COUNT(DISTINCT CASE WHEN actual_contribution_rate > 0 OR actual_contribution_amount>0 THEN platform_person_internal_id END) AS DOUBLE PRECISION)/ NULLIF(COUNT(DISTINCT platform_person_internal_id),0) AS participation_rate
+FROM join_person_contributions
+	GROUP BY
+	client_id
+
+	,reporting_month

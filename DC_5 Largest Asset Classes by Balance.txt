@@ -1,0 +1,111 @@
+WITH 
+dc_account_balances AS (
+  SELECT
+    fb.client_id, fb.row_level_security_filter_value,
+    fb.platform_person_internal_id,
+    fb.plan_id,
+    fb.fund_id,
+    fb.effective_date,
+    fb.closing_balance_amount
+  FROM
+    wealth_rpt.dc_account_balances fb
+  WHERE
+    fb.closing_balance_amount > 0
+    AND fb.client_id IN ( cast(<<$pClientId>> as int))
+    AND fb.effective_date = current_date-1
+)
+,
+person_employment AS (
+  SELECT
+    e.global_client_id,
+    e.global_person_id,
+    e.client_id, e.client_id_string,
+    e.platform_person_internal_id,
+	lookup.standard_value as roll_up_1
+     FROM person_rpt.person_employment e
+	 left join (select distinct standard_key,standard_value from adlfound_itg.standard_rollups_lookup where 
+	 standard_group_key in ('EMPL-STAT-CD-ROLLUP1') ) lookup
+	 on trim(standard_employment_status_code)=(standard_key)
+  WHERE
+    upper(trim(lookup.standard_value)) in ('ACTIVE')
+    AND e.begin_date <= current_date-1
+    AND e.end_date >= current_date-1
+    AND e.client_id =  cast(<<$pClientId>> as int)
+)
+,	
+dc_account_balances_active as (
+SELECT
+    fb.client_id, pe.client_id_string, fb.row_level_security_filter_value,
+    fb.platform_person_internal_id,
+    fb.plan_id,
+    fb.fund_id,
+    fb.effective_date,
+    fb.closing_balance_amount
+  FROM
+    dc_account_balances fb 
+	inner join person_employment pe on
+    fb.client_id = pe.client_id 
+	and fb.platform_person_internal_id= pe.platform_person_internal_id
+),
+asset AS (
+  SELECT
+    distinct client_id,
+    plan_identifier,
+    fund_identifier,
+    asset_name,
+    asset_class_identifier AS asset_class_id
+  FROM
+    wealth_rpt.dc_icb_fund_asset_mapping
+  WHERE
+    client_id IN ( cast(<<$pClientId>> as int))
+	AND asset_class_identifier<>17
+),
+join_balance_asset AS (
+  SELECT
+    a.client_id, a.client_id_string, a.row_level_security_filter_value,
+    a.platform_person_internal_id,
+    a.plan_id,
+    a.fund_id,
+    a.closing_balance_amount as planbalance,
+    b.asset_name,
+    b.asset_class_id,
+	row_number() over (partition by a.client_id,a.platform_person_internal_id) as unq_ppt,
+	row_number() over (partition by a.client_id,a.platform_person_internal_id,asset_class_id) as unq_ppt_ast
+  FROM
+    dc_account_balances_active a
+    INNER JOIN asset b ON a.client_id = b.client_id
+    AND a.fund_id = b.fund_identifier
+    AND a.plan_id = b.plan_identifier
+)
+,
+aggregated_data AS (
+  SELECT
+    client_id, client_id_string, row_level_security_filter_value,
+    asset_name,
+	asset_class_id,
+    SUM(planbalance) AS plan_balance,
+    sum(CASE WHEN unq_ppt_ast = 1 THEN 1 ELSE 0 END) AS NO_PPT_IN_AST,
+    SUM(SUM(planbalance)) OVER () AS TTL_DOLLORS_INVESTED_IN_PLAN,
+    SUM(SUM(CASE WHEN unq_ppt = 1 THEN 1 ELSE 0 END)) OVER () AS TTL_NO_PPT_ENRLD_PLAN
+FROM
+    join_balance_asset
+GROUP BY
+    client_id, client_id_string, row_level_security_filter_value,
+    asset_name,
+	asset_class_id
+)
+select 
+  ad.client_id, ad.client_id_string, ad.row_level_security_filter_value,
+  --ltrim(to_char(ad.client_id, '99999')) as client_id_string,
+  ad.asset_name,
+  ad.asset_class_id,
+  --COALESCE(Round(ad.plan_balance * 100::DECIMAL / NULLIF(ad.TTL_DOLLORS_INVESTED_IN_PLAN, 0), 2), 0) AS percent_of_total_dollars,
+  --COALESCE(Round(ad.NO_PPT_IN_AST * 100::DECIMAL / NULLIF(ad.TTL_NO_PPT_ENRLD_PLAN, 0), 2), 0) AS percent_of_total_participants
+  
+  ad.plan_balance as percent_of_total_dollars_Numerator,
+  NULLIF(ad.TTL_DOLLORS_INVESTED_IN_PLAN, 0) AS percent_of_total_dollars_Denominator,
+  ad.NO_PPT_IN_AST as percent_of_total_participants_Numerator,
+  NULLIF(ad.TTL_NO_PPT_ENRLD_PLAN, 0) AS percent_of_total_participants_Denominator
+  FROM
+  aggregated_data ad
+  ORDER BY 6 desc limit 5

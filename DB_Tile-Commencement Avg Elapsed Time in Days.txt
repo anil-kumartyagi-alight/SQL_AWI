@@ -1,0 +1,81 @@
+WITH Exp_db_cmnct_fact_detail AS (
+    SELECT DISTINCT
+        platform_id AS platform_id,
+        client_id AS client_id, client_id_string, row_level_security_filter_value, 
+        platform_person_internal_id AS person_internal_id,
+        convert_timezone('CST', 'UTC', intent_retire_activity_completed_cst_ts) AS iret_event_end_timestamp,
+        commencement_result_elapsed_days AS elapsed_time_in_days,
+		'elapsed_time' AS summary_dimension_type
+        FROM wealth_rpt.db_commencement db_commencement_detail
+    WHERE client_id = ( cast(<<$pClientId>> as int)) AND 
+	convert_timezone('CST', 'UTC', activity_initiated_cst_ts) >= '1800-01-01'
+	  AND commencement_result_elapsed_days IS NOT NULL
+),
+
+join_plan_prsn_atrb_comnc_fact AS (
+    SELECT DISTINCT
+        a.platform_id AS platform_id,
+        a.client_id AS client_id, a.client_id_string, a.row_level_security_filter_value, 
+        a.person_internal_id AS person_internal_id,
+        a.elapsed_time_in_days AS elapsed_time_in_days,
+        a.summary_dimension_type AS summary_dimension_type,
+        DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', a.iret_event_end_timestamp))) AS reporting_month_date,
+        CASE WHEN nvl(trim(employment_status),'') IS NULL then 'NA' else nvl(trim(employment_status),'') END AS employment_status
+		FROM Exp_db_cmnct_fact_detail a
+    INNER JOIN person_rpt.person_employment b ON a.platform_id = b.platform_id 
+        AND a.client_id = b.client_id
+        AND a.person_internal_id = b.platform_person_internal_id 
+		AND DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', a.iret_event_end_timestamp))) >= CAST(b.begin_date AS DATE)
+        AND DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', a.iret_event_end_timestamp))) <= CAST(b.end_date AS DATE)
+		WHERE b.client_id = ( cast(<<$pClientId>> as int)) 
+),
+
+Exp_elpsed_time_cmnct_smry_distinct_count AS ( SELECT 
+platform_id,
+client_id, client_id_string, row_level_security_filter_value, 
+summary_dimension_type,
+reporting_month_date,
+employment_status,
+SUM(elapsed_time_in_days) AS generic_column_9,
+count(distinct person_internal_id) AS employee_distinct_count_month
+FROM join_plan_prsn_atrb_comnc_fact
+GROUP BY 1,2,3,4,5,6,7
+),
+
+exp_average_elp_days_cmnct_days  as (SELECT
+platform_id,
+client_id, client_id_string, row_level_security_filter_value, 
+cast(generic_column_9 as int) AS gnrc_col_9,
+NVL(TRIM(summary_dimension_type), '') AS smry_dimn_type,
+employment_status AS empl_stat,
+CAST(CASE WHEN employee_distinct_count_month IS NULL then 0 else employee_distinct_count_month END AS INT) AS empl_dist_cnt_mnth,
+reporting_month_date  AS reporting_month_dt
+from Exp_elpsed_time_cmnct_smry_distinct_count
+)
+
+
+SELECT 
+client_id, client_id_string, row_level_security_filter_value, 
+    CAST(SUM(gnrc_col_9) AS DOUBLE PRECISION) / SUM(empl_dist_cnt_mnth) AS Average_number_of_Elapse_Days, 
+    reporting_month_dt AS Reporting_Month_Date
+FROM
+    exp_average_elp_days_cmnct_days
+WHERE 
+    smry_dimn_type = 'elapsed_time' AND
+	(
+	(
+	cast(<<$pClientId>> as int) <> '00095' and
+    cast(reporting_month_dt as date) <= cast(LAST_DAY(ADD_MONTHS(CURRENT_DATE, -1)) as date) AND
+    cast(reporting_month_dt as date) >= cast(ADD_MONTHS(LAST_DAY(ADD_MONTHS(CURRENT_DATE, -1)), -12) as date)
+	
+	)
+	OR
+	
+	(
+	cast(<<$pClientId>> as int) = '00095' and
+	cast(reporting_month_dt as date) <= cast('2024-07-31' as date) AND
+    cast(reporting_month_dt as date) >= cast(ADD_MONTHS('2024-07-31', -12) as date)
+	)
+    )
+GROUP BY 
+    client_id, client_id_string, row_level_security_filter_value, reporting_month_dt

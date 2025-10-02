@@ -1,0 +1,143 @@
+With Join_base_elmnt_id AS (
+    SELECT 
+        inst_elmnt.base_element_id AS base_elmnt_id,
+        inst_elmnt.client_id AS client_id,
+        inst_elmnt.data_instance_id AS data_inst_id
+    FROM adlfound_itg.ccr_instance_element inst_elmnt
+    WHERE 
+	 inst_elmnt.client_id = cast(<<$pClientId>> as int)     AND 
+	base_element_id IN (100780,101830, 101810, 100790,102050)
+),
+Join_ccr_act_ids AS (
+    SELECT 
+        ccr_inst.client_id AS client_id,
+        base_elmnt.base_elmnt_id,
+        TRIM(ccr_inst.provision_key_value) AS act_id
+    FROM Join_base_elmnt_id base_elmnt
+    INNER JOIN adlfound_itg.ccr_instance ccr_inst
+    ON base_elmnt.client_id = ccr_inst.client_id
+    AND base_elmnt.data_inst_id = ccr_inst.data_instance_id
+    WHERE ccr_inst.base_provision_type_id = 1000000
+),
+dc_distributions AS (
+    SELECT 
+        client_id, client_id_string, row_level_security_filter_value,
+        platform_person_internal_id,
+		platform_id,
+        platform_indicator_code,
+        plan_id,
+        activity_reference_number_id,
+        payment_result_effective_date,
+        activity_id,
+		hardship_reason_code_1 
+    FROM wealth_rpt.vw_dc_distributions
+    WHERE  client_id = cast(<<$pClientId>> as int)  AND 
+	last_day(payment_result_effective_date) = last_day(ADD_MONTHS(current_date, -1))
+)
+
+-- select activity_id,count(*) from  dc_distributions where activity_id in  ( 946544,870,853510)  group by 1
+
+,
+
+ranked_activity AS (
+    SELECT
+        pa.client_id,
+        pa.platform_id,
+		pa.activity_id,
+		pa.activity_status,
+        pa.platform_person_internal_id,
+        pa.activity_reference_id,         
+        pa.activity_name,
+        pa.activity_effective_date,
+        pa.domain,
+        pa.activity_change_cst_ts,
+        ROW_NUMBER() OVER (
+            PARTITION BY pa.client_id,
+                         pa.platform_id,
+                         pa.platform_person_internal_id,
+                         pa.activity_reference_id
+            ORDER BY pa.activity_change_cst_ts DESC
+        ) AS rnk
+    FROM alightops_rpt.person_activity pa
+    WHERE pa.client_id = CAST(<<$pClientId>> AS INT)
+),
+activity_data AS (
+    SELECT
+        ra.client_id,
+        ra.platform_id,
+		ra.activity_id,
+		ra.activity_status,
+        ra.platform_person_internal_id,
+        ra.activity_reference_id,
+        ra.activity_name,
+        ra.domain,
+		ra.activity_effective_date,
+        ra.activity_change_cst_ts
+    FROM ranked_activity ra
+    WHERE ra.rnk = 1
+      AND last_day(ra.activity_effective_date) = last_day(ADD_MONTHS(current_date, -1))
+      AND ra.domain = 'DC'
+    --   AND EXISTS (
+    --         SELECT 1
+    --         FROM dc_distributions dd
+    --         WHERE dd.platform_person_internal_id = ra.platform_person_internal_id
+    --           AND dd.activity_reference_number_id = ra.activity_reference_id
+    --           AND dd.client_id = ra.client_id
+    --           AND dd.platform_id = ra.platform_id
+              
+    --     )
+),
+
+join_distribution_bal AS (
+    SELECT
+        DIS.client_id, DIS.client_id_string, DIS.row_level_security_filter_value,
+        DIS.platform_person_internal_id,
+        DIS.plan_id,
+        DIS.activity_id,
+        DIS.payment_result_effective_date,
+		last_day(payment_result_effective_date) as reporting_month,
+        base_elmnt_id,
+		CASE
+            WHEN CCR.base_elmnt_id IN (100780) and DIS.hardship_reason_code_1='EDU'
+                THEN 'Education'
+            WHEN CCR.base_elmnt_id IN (100780) and DIS.hardship_reason_code_1='EVI'
+                THEN 'Eviction'
+            WHEN CCR.base_elmnt_id IN (100780) and DIS.hardship_reason_code_1='FNRL'
+                THEN 'Funeral Expense'
+            WHEN CCR.base_elmnt_id IN (100780) and DIS.hardship_reason_code_1='HOME'
+                THEN 'Home Purchase'   
+            WHEN CCR.base_elmnt_id IN (100780) and DIS.hardship_reason_code_1='MED'
+                THEN 'Medical'     
+            WHEN CCR.base_elmnt_id IN (100780) and DIS.hardship_reason_code_1='PRNC'
+                THEN 'Damage to Principal Residence' 
+            ELSE 'Others' END AS Hardship_Reason 
+    FROM dc_distributions DIS
+    LEFT JOIN activity_data activity 
+    ON DIS.client_id = activity.client_id
+	AND DIS.activity_id = activity.activity_id 
+    AND DIS.platform_person_internal_id = activity.platform_person_internal_id
+    AND DIS.activity_reference_number_id = activity.activity_reference_id
+	AND DIS.platform_id = activity.platform_id
+	LEFT JOIN Join_ccr_act_ids CCR
+    ON activity.client_id = CCR.client_id
+    AND activity.activity_id = CCR.act_id   
+   	AND last_day(activity.activity_effective_date) = last_day(ADD_MONTHS(current_date, -1))
+    where 
+    --activity.activity_status = 'CPLT' 
+    --activity.domain = 'DC'
+	CCR.base_elmnt_id IN (100780)
+)
+
+--select * from join_distribution_bal;
+--select distinct activity_id  from join_distribution_bal;
+
+SELECT
+        client_id, client_id_string, row_level_security_filter_value,
+		count(distinct platform_person_internal_id) as tot_ppt,
+        Hardship_Reason,
+        reporting_month
+    from join_distribution_bal
+    group by 
+        client_id, client_id_string, row_level_security_filter_value,
+        Hardship_Reason,
+        reporting_month

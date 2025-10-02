@@ -1,0 +1,199 @@
+WITH fund_data AS (
+    SELECT 
+        client_id, platform_id, platform_person_internal_id, plan_id, fund_id, 
+        hard_balance_id, total_contribution_amount, accounting_activity_effective_date
+    FROM wealth_rpt.dc_hard_balance
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND accounting_activity_effective_date BETWEEN <<$pBeginDate>>  AND <<$pEndDate>>
+        AND total_contribution_amount <> 0
+
+),
+person_data AS (
+    SELECT 
+        platform_id, client_id, client_id_string, platform_person_internal_id, 
+        last_name, first_name, middle_name, gender, birth_date, 
+        person_reason_code, union_name, begin_date, end_date
+    FROM person_rpt.person p
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND <<$pEndDate>> BETWEEN begin_date AND end_date
+      AND EXISTS (
+          SELECT 1 FROM fund_data fd
+          WHERE fd.platform_person_internal_id = p.platform_person_internal_id
+      )
+),
+employment_data AS (
+    SELECT 
+        client_id, platform_id, platform_person_internal_id, employee_id, hire_date, 
+        termination_date, expected_annual_base_salary, 
+        standard_employment_status as employment_status1, standard_value AS employment_status, 
+        employment_status_begin_date, fulltime_parttime_status, hourly_salary_status, 
+        begin_date, end_date
+    FROM person_rpt.person_employment p
+	LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+		ON p.standard_employment_status_code = rl.standard_key
+		AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND <<$pEndDate>> BETWEEN begin_date AND end_date
+      AND EXISTS (
+          SELECT 1 FROM fund_data fd
+          WHERE fd.platform_person_internal_id = p.platform_person_internal_id
+      )
+),
+security_filter AS (
+    SELECT 
+        client_id, platform_id, platform_person_internal_id, row_level_security_filter_value
+    FROM person_itg.person_security_filter sf
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND EXISTS (
+          SELECT 1 FROM fund_data fd
+          WHERE fd.platform_person_internal_id = sf.platform_person_internal_id
+      )
+),
+custom_filter AS (
+    SELECT 
+        client_id, platform_id, platform_person_internal_id, 
+        custom_filter_1, custom_filter_2, custom_filter_3, 
+        custom_filter_4, custom_filter_5
+    FROM person_itg.person_custom_filter pcf
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND data_product = 'DC'
+      AND <<$pEndDate>> BETWEEN begin_date AND end_date
+      AND EXISTS (
+          SELECT 1 FROM fund_data fd
+          WHERE fd.platform_person_internal_id = pcf.platform_person_internal_id
+      )
+),
+plan_status AS (
+    SELECT 
+        a.client_id, a.plan_id, a.platform_person_internal_id, 
+        a.participation_status_description, b.category_type_code
+    FROM wealth_rpt.person_planstatus_dim a
+    INNER JOIN wealth_rpt.dc_category_dim b 
+        ON a.client_id = b.client_id 
+        AND a.category_id = b.category_id 
+        AND a.plan_id = b.plan_id
+    WHERE a.platform_indicator_code IN ('R3', 'R4', 'DCE')
+      AND b.category_type_code = 'PS'
+      AND <<$pEndDate>> BETWEEN a.begin_date AND a.end_date
+      AND b.category_definition_brand_code = 'PRTC-STAT'
+      AND a.client_id = cast(<<$pClientId>> as int)
+      AND EXISTS (
+          SELECT 1 FROM fund_data fd
+          WHERE fd.platform_person_internal_id = a.platform_person_internal_id
+      )
+),
+hardbalance_dim AS (
+    SELECT  
+        client_id, hardbalance_id AS hbal_id, account_id AS acct_id, plan_id,
+        fund_id, plan_long_description AS plan_ldsc_tx, 
+        account_long_description AS acct_ldsc_tx, plan_type_code AS plan_type_cd
+    FROM wealth_rpt.hardbalance_dim
+    WHERE plan_type_cd = 'DC'
+      AND client_id = cast(<<$pClientId>> as int)
+),
+Main_Query AS (
+    SELECT 
+        person.client_id AS Client_ID,
+        person.client_id_string,
+        person.platform_person_internal_id AS platform_person_internal_id,
+		person.platform_id,
+        employee.employee_id AS Employee_ID,
+        person.last_name AS Last_Name,
+        person.first_name AS First_Name,
+        person.middle_name AS Middle_Name,
+        person.gender AS Gender,
+        person.birth_date AS Birth_Date,
+        employee.hire_date AS Hire_Date,
+        FLOOR(employee.expected_annual_base_salary) AS Salary,
+        FLOOR(DATEDIFF(day, person.birth_date, <<$pEndDate>>) / 365.25) AS Age,
+        CASE
+            WHEN person.person_reason_code = 'Employee' AND UPPER(employee.employment_status) = 'ACTIVE'
+                THEN FLOOR(DATEDIFF(day, employee.hire_date, <<$pEndDate>>) / 365.25)
+            WHEN person.person_reason_code = 'Employee' AND UPPER(employee.employment_status) <> 'ACTIVE'
+                AND employee.termination_date IS NOT NULL AND EXTRACT(YEAR FROM employee.termination_date) <> 2299
+                THEN FLOOR(DATEDIFF(day, employee.hire_date, employee.termination_date) / 365.25)
+            ELSE NULL
+        END AS Tenure,
+        person.person_reason_code AS Person_Type,
+        employee.employment_status1 AS Employment_Status,
+        employee.employment_status_begin_date AS Employment_Status_Begin_Date,
+        employee.fulltime_parttime_status AS FullTime_PartTime,
+        employee.hourly_salary_status AS Salary_Hourly,
+        person.union_name AS Union,
+        hbal_d.plan_ldsc_tx AS Plan_Name,
+        ppstat.participation_status_description AS Plan_Status,
+        hbal_d.acct_ldsc_tx AS Account,
+        psf.row_level_security_filter_value,
+        pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, 
+        pcf.custom_filter_4, pcf.custom_filter_5,
+        ROUND(SUM(fund.total_contribution_amount), 2) AS Contribution_Amount
+    FROM person_data person
+    INNER JOIN employment_data employee ON 
+        person.client_id = employee.client_id AND 
+        person.platform_id = employee.platform_id AND 
+        person.platform_person_internal_id = employee.platform_person_internal_id
+    LEFT JOIN security_filter psf ON 
+        person.platform_id = psf.platform_id AND 
+        person.platform_person_internal_id = psf.platform_person_internal_id AND 
+        person.client_id = psf.client_id
+    LEFT JOIN custom_filter pcf ON 
+        person.platform_id = pcf.platform_id AND 
+        person.platform_person_internal_id = pcf.platform_person_internal_id AND 
+        person.client_id = pcf.client_id
+    INNER JOIN fund_data fund ON 
+        person.client_id = fund.client_id AND 
+        person.platform_id = fund.platform_id AND 
+        person.platform_person_internal_id = fund.platform_person_internal_id
+    INNER JOIN plan_status ppstat ON 
+        ppstat.client_id = fund.client_id AND 
+        ppstat.plan_id = fund.plan_id AND 
+        ppstat.platform_person_internal_id = fund.platform_person_internal_id
+    INNER JOIN hardbalance_dim hbal_d ON 
+        hbal_d.client_id = fund.client_id AND 
+        hbal_d.plan_id = fund.plan_id AND 
+        hbal_d.fund_id = fund.fund_id AND
+        hbal_d.hbal_id = fund.hard_balance_id
+    WHERE fund.client_id = cast(<<$pClientId>> as int)
+    GROUP BY 
+        person.client_id, person.client_id_string, person.platform_person_internal_id,
+		person.platform_id,
+        employee.employee_id, person.last_name, person.first_name, person.middle_name,
+        person.gender, person.birth_date, employee.hire_date, employee.termination_date,
+        employee.expected_annual_base_salary, person.person_reason_code, person.union_name,
+        employee.employment_status, employee.employment_status1, employee.employment_status_begin_date,
+        employee.fulltime_parttime_status, employee.hourly_salary_status,
+        hbal_d.plan_ldsc_tx, ppstat.participation_status_description,
+        hbal_d.acct_ldsc_tx, psf.row_level_security_filter_value,
+        pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, 
+        pcf.custom_filter_4, pcf.custom_filter_5
+),
+age_range AS (
+    SELECT standard_min, standard_max, standard_display_name
+    FROM adlfound_itg.standard_ranges_lookup 
+    WHERE standard_group_key = 'AGE_RANGE_DC'
+),
+tenure_range AS (
+    SELECT standard_min, standard_max, standard_display_name
+    FROM adlfound_itg.standard_ranges_lookup 
+    WHERE standard_group_key = 'TENURE'
+),
+salary_range AS (
+    SELECT standard_min, standard_max, standard_display_name
+    FROM adlfound_itg.standard_ranges_lookup 
+    WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+),
+ main as (SELECT 
+    Main_Query.*, 
+    AGE_RG.standard_display_name AS Age_Range,
+    salary_rg.standard_display_name AS Salary_Range,
+    TENURE_RG.standard_display_name AS Employment_Range
+FROM Main_Query
+LEFT JOIN age_range AGE_RG 
+    ON FLOOR(Main_Query.Age) BETWEEN AGE_RG.standard_min AND AGE_RG.standard_max
+LEFT JOIN tenure_range TENURE_RG 
+    ON FLOOR(Main_Query.Tenure) BETWEEN TENURE_RG.standard_min AND TENURE_RG.standard_max
+LEFT JOIN salary_range salary_rg 
+    ON FLOOR(Main_Query.Salary) BETWEEN salary_rg.standard_min AND salary_rg.standard_max
+WHERE Main_Query.Plan_Name IS NOT NULL
+)
+select * from main

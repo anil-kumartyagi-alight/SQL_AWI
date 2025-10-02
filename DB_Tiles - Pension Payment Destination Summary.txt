@@ -1,0 +1,84 @@
+WITH person_attributes
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id, client_id_string, row_level_security_filter_value
+		,platform_id
+		,platform_person_internal_id
+		, gender
+		,birth_date
+		,person_reason_code
+		,union_name
+	FROM person_rpt.person
+	WHERE 
+	--person_reason_code = 'Employee'AND 
+	
+	client_id = cast(<<$pClientId>> as int) and 
+	
+		(
+		(begin_date <= last_day(add_months(current_date, -1))
+		AND end_date >= last_day(add_months(current_date, -1))
+		AND cast(<<$pClientId>> as int) <> '00095' )
+		OR
+		
+		(last_day(begin_date) <= '2024-07-31'
+		AND last_day(end_date) >= '2024-07-31'
+		AND cast(<<$pClientId>> as int) = '00095' )
+		)
+	)
+	
+, query_db_payments
+As (
+select client_id,platform_id,payment_id, payment_effective_date, plan,plan_id,payment_type, payment_destination,total_payment_amount,platform_person_internal_id
+from wealth_rpt.db_payments where 
+client_id= cast(<<$pClientId>> as int) and
+(
+(
+cast(<<$pClientId>> as int) <> '00095' and 
+payment_effective_date between date_trunc('month', add_months(current_date, -1))  and last_day(add_months(current_date, -1))
+)
+OR
+(
+cast(<<$pClientId>> as int) = '00095' and 
+last_day(payment_effective_date) = '2024-07-31'
+)
+)
+and total_payment_amount>0 
+--and payment_destination<>'NA' 
+and payment_type<>'NA'
+)
+
+
+    SELECT
+		case when cast(<<$pClientId>> as int) = '00095' then 'Jul 2024'
+		else to_char(current_date - INTERVAL '1 month','Mon YYYY') end
+		as Previous_Month_year,
+        person_attributes.client_id, person_attributes.client_id_string, person_attributes.row_level_security_filter_value, 
+		--ltrim(to_char(person_attributes.client_id,'99999')) as client_id_string, 
+		case when query_db_payments.payment_destination='Drct_Dpst' then 'Direct Deposit'
+		when query_db_payments.payment_destination='Paper_Chk' then 'Paper Payments' 
+		when query_db_payments.payment_destination='Rlvrs' then 'Rollovers'
+		when query_db_payments.payment_destination='Dflt_Rlvr' then 'Default Rollovers'
+		end as payment_destination,
+		query_db_payments.payment_type,
+		sum(query_db_payments.total_payment_amount) Payment_amount,
+		COUNT(DISTINCT(CONCAT(CONCAT(CONCAT(query_db_payments.platform_person_internal_id,query_db_payments.payment_id),query_db_payments.plan_id),query_db_payments.payment_effective_date)) ) as Tot_ppt,
+        query_db_payments.plan_id,
+		query_db_payments.plan
+        from
+		query_db_payments inner join person_attributes  on
+		 query_db_payments.client_id = person_attributes.client_id
+		AND query_db_payments.platform_person_internal_id = person_attributes.platform_person_internal_id
+		AND query_db_payments.platform_id = person_attributes.platform_id
+		group by 
+		person_attributes.client_id, person_attributes.client_id_string, person_attributes.row_level_security_filter_value, 
+        query_db_payments.plan,
+        query_db_payments.payment_type,
+		case when query_db_payments.payment_destination='Drct_Dpst' then 'Direct Deposit'
+		when query_db_payments.payment_destination='Paper_Chk' then 'Paper Payments' 
+		when query_db_payments.payment_destination='Rlvrs' then 'Rollovers' 
+		when query_db_payments.payment_destination='Dflt_Rlvr' then 'Default Rollovers'
+		end ,
+		query_db_payments.plan_id,
+		case when cast(<<$pClientId>> as int) = '00095' then 'Jul 2024'
+		else to_char(current_date - INTERVAL '1 month','Mon YYYY') end

@@ -1,0 +1,236 @@
+With calendar
+AS  (
+   select distinct last_day(calendar_date) as reporting_month from adlfound_itg.calendar 
+   where calendar_date= current_date-1 or calendar_date= date(date_trunc('year', current_date) -1)
+    )
+,mv_person
+AS (
+                SELECT DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id, client_id_string, row_level_security_filter_value
+                                ,platform_person_internal_id
+                                ,platform_id
+                                ,gender
+                                ,birth_date
+                                ,person_reason_code
+                                ,union_name
+								,c.reporting_month 
+                FROM person_rpt.person CROSS JOIN calendar c
+                WHERE person_reason_code = 'Employee'
+                                AND begin_date <= reporting_month
+                                AND end_date >= reporting_month
+                                 AND client_id = cast(<<$pClientId>> as int)
+                )
+                ,mv_person_employment
+AS (
+                SELECT DISTINCT e.global_client_id
+                                ,e.global_person_id
+                                ,e.client_id
+                                ,e.platform_person_internal_id
+                                ,e.platform_id
+                                ,e.expected_annual_base_salary
+                                ,e.hourly_salary_status
+                                ,e.fulltime_parttime_status
+                                --,e.employment_status
+                                ,e.hire_date
+                                ,e.termination_date
+								,lookup.standard_value as employment_status
+								,c.reporting_month 
+                FROM person_rpt.person_employment e 
+				left join (select distinct standard_key,standard_value from adlfound_itg.standard_rollups_lookup where 
+				standard_group_key in ('EMPL-STAT-CD-ROLLUP1') ) lookup
+				on trim(standard_employment_status_code)=(standard_key)
+				CROSS JOIN calendar c
+                WHERE 
+				upper(trim(lookup.standard_value)) in  ('ACTIVE')
+                                AND begin_date <= reporting_month
+                                AND end_date >= reporting_month 
+                                AND client_id = cast(<<$pClientId>> as int)
+                )
+                ,person
+AS (
+                SELECT p.global_client_id
+                                ,p.global_person_id
+                                ,p.client_id, p.client_id_string, p.row_level_security_filter_value
+                                ,p.platform_person_internal_id
+                                ,e.expected_annual_base_salary as salary 
+                                ,e.hourly_salary_status
+                                ,e.fulltime_parttime_status
+                                ,e.employment_status
+                                ,p.person_reason_code
+                                ,p.union_name
+                                ,p.gender
+								,e.reporting_month
+                                ,Floor ( CASE 
+                                                WHEN p.birth_date IN (
+                                                                                '1800-01-01'
+                                                                                ,'1900-01-01'
+                                                                                ,'1901-01-01'
+                                                                                ,'1910-01-01'
+                                                                                ,'1930-01-01'
+                                                                                )
+                                                                THEN NULL
+                                                ELSE ROUND(DATEDIFF(DAY, p.birth_date, current_date) / 365.25, 2)
+                                                END ) AS age
+                                ,CASE 
+                                                WHEN p.person_reason_code = 'Employee'
+                                                                AND upper(e.employment_status) = 'ACTIVE'
+                                                                THEN ROUND(DATEDIFF(DAY, e.hire_date, current_date) / 365.25, 2)
+                                                WHEN p.person_reason_code = 'Employee'
+                                                                AND upper(e.employment_status) <> 'ACTIVE'
+                                                                AND e.termination_date IS NOT NULL
+                                                                AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+                                                                THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+                                                ELSE NULL
+                                                END AS tenure
+                FROM mv_person p
+                inner JOIN mv_person_employment e ON p.client_id = e.client_id
+                                AND p.platform_person_internal_id = e.platform_person_internal_id
+                                AND p.platform_id = e.platform_id
+                                --AND p.global_client_id = e.global_client_id
+                                --AND p.global_person_id = e.global_person_id
+								AND p.reporting_month = e.reporting_month 
+                                AND p.client_id = cast(<<$pClientId>> as int)
+                )
+                ,range_lookup
+AS (
+                SELECT standard_group_key
+                                ,standard_display_name
+                                ,standard_min
+                                ,standard_max
+                                ,OWNER
+                FROM adlfound_itg.standard_ranges_lookup
+                )
+                ,dc_person_attributes
+AS (
+                SELECT a.client_id, a.client_id_string, a.row_level_security_filter_value
+                                ,a.platform_person_internal_id
+                                ,a.hourly_salary_status
+                                ,a.fulltime_parttime_status
+                                ,a.person_reason_code
+                                ,a.union_name
+                                ,a.gender
+                                ,a.employment_status
+                                ,a.age
+								,a.reporting_month
+                                ,B.standard_display_name AS AGE_RANGE
+                                ,a.TENURE
+                                ,C.standard_display_name AS TENURE_RANGE
+                                ,a.salary
+                                ,D.standard_display_name AS SALARY_RANGE
+                FROM person a
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'AGE_RANGE_DC'
+                                ) b ON floor(a.age) between b.standard_min AND b.standard_max 
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'TENURE'
+                                ) C ON floor(a.tenure) between C.standard_min AND C.standard_max 
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+                                ) D ON floor(a.salary) between D.standard_min AND D.standard_max 
+                
+                )
+,plan_balance AS (
+    SELECT distinct fb.client_id, pa.client_id_string, pa.row_level_security_filter_value,
+           fb.platform_person_internal_id,
+           fb.plan_id,
+           fb.fund_id,
+		   AGE_RANGE,
+		   SALARY_RANGE,
+		   TENURE_Range,
+           pa.reporting_month		   
+              FROM wealth_rpt.dc_hard_balance fb       
+    INNER JOIN dc_person_attributes pa  on 
+                       fb.client_id = pa.client_id
+                                   AND fb.platform_person_internal_id = pa.platform_person_internal_id 
+    WHERE fb.closing_units > 0
+           AND fb.client_id IN (<<$pClientId>>)
+           AND fb.begin_date <= pa.reporting_month
+              AND fb.end_date >= pa.reporting_month
+)
+,asset AS (
+    SELECT distinct client_id,
+           plan_identifier,
+           fund_identifier,
+           asset_name,
+           asset_class_identifier AS asset_class_id
+    FROM wealth_rpt.dc_icb_fund_asset_mapping  where client_id= cast(<<$pClientId>> as int)
+    )
+,premixed as 
+(SELECT  client_id,
+plan_id,
+fund_id,
+asset_class_id,
+fund,
+asset_class,
+begin_date,
+end_date 
+FROM wealth_rpt.dc_premixed  where client_id in (<<$pClientId>>)
+)
+,join_balance_asset AS (
+    SELECT a.client_id, a.client_id_string, a.row_level_security_filter_value,
+           a.platform_person_internal_id,
+           a.plan_id,
+           a.fund_id,
+		   a.reporting_month,
+           b.asset_name,
+           b.asset_class_id,
+		   AGE_RANGE,
+		   SALARY_RANGE,
+		   TENURE_Range  
+    FROM plan_balance a
+    LEFT JOIN asset b ON a.client_id = b.client_id
+           AND a.fund_id = b.fund_identifier
+           AND a.plan_id = b.plan_identifier where asset_class_id <> 17
+)
+,EXP_Master_fact as
+(
+SELECT a.client_id, a.client_id_string, a.row_level_security_filter_value,
+           a.platform_person_internal_id,
+           a.plan_id,
+           a.fund_id,
+           a.asset_name,
+		   a.reporting_month,
+           b.asset_class AS target_fund_name,
+           b.asset_class_id,
+		   AGE_RANGE,
+		   SALARY_RANGE,
+		   TENURE_Range , 
+           case when (trim(a.asset_name)='Premixed(Target Funds)' and trim(b.asset_class) is not NULL) then 1 else 0 end AS target_flag
+   FROM join_balance_asset a left join wealth_rpt.dc_premixed b
+        ON a.client_id = b.client_id
+           AND a.fund_id = b.fund_id
+           and a.asset_class_id=b.asset_class_id
+           and current_date between b.begin_date and b.end_date
+     ),
+balance_asset_premix_agg as 
+(
+SELECT client_id, client_id_string, row_level_security_filter_value, platform_person_internal_id, plan_id,reporting_month,AGE_RANGE,
+		   SALARY_RANGE,
+		   TENURE_Range ,
+           sum (target_flag) AS target_count 
+from EXP_Master_fact
+group by client_id, client_id_string, row_level_security_filter_value, platform_person_internal_id, plan_id,reporting_month ,AGE_RANGE,
+		   SALARY_RANGE,
+		   TENURE_Range 
+)
+SELECT client_id, client_id_string, row_level_security_filter_value
+--,plan_id
+,EXTRACT(YEAR FROM reporting_month) as reporting_year
+--,AGE_RANGE
+--,
+--		   SALARY_RANGE,
+--		   TENURE_Range 
+,
+		--((count(case when target_count>0 then platform_person_internal_id end)) * 1.0) / count(platform_person_internal_id)  AS participant_with_target_date_fund
+        count(case when target_count > 0 then platform_person_internal_id end) as participant_with_target_dated_fund_count, count(platform_person_internal_id) as participant_count
+         FROM balance_asset_premix_agg group by client_id, client_id_string, row_level_security_filter_value
+        --,
+        --plan_id
+        ,EXTRACT(YEAR FROM reporting_month)

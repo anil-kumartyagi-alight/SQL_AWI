@@ -1,0 +1,216 @@
+WITH mv_person
+AS (
+	SELECT DISTINCT client_id
+		,platform_person_internal_id
+		,platform_id
+		,client_id_string
+		,row_level_security_filter_value
+	FROM person_rpt.person
+	WHERE person_reason_code = 'Employee'
+		AND begin_date <= CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE)
+		AND end_date >= CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE)
+		AND client_id =<<$pClientId>>
+	)
+	,mv_person_employment
+AS (
+	SELECT DISTINCT 
+		client_id
+		,platform_person_internal_id
+		,platform_id
+		,standard_value AS employment_status
+FROM person_rpt.person_employment pe
+LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+	ON pe.standard_employment_status_code = rl.standard_key
+	AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+	WHERE 
+		begin_date <= CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE)
+		AND end_date >= CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE)
+		AND client_id =<<$pClientId>>
+		AND UPPER(TRIM(standard_value)) in ('ACTIVE')
+	)
+	,person
+AS (
+	SELECT p.client_id
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,p.platform_person_internal_id
+	FROM mv_person p
+	inner JOIN mv_person_employment e ON p.client_id = e.client_id
+		AND p.platform_person_internal_id = e.platform_person_internal_id
+		AND p.platform_id = e.platform_id
+		AND p.client_id =<<$pClientId>>
+	)
+	,PRSN_PLANSTAT_DIMN01
+AS (
+	SELECT a.client_id AS CLIENT_ID
+		,a.platform_person_internal_id AS PRSN_INTN_ID
+		,a.begin_date AS PP_STAT_EFBEG_DT
+		,a.plan_id AS PLAN_ID
+		,b.category_type_code AS CAT_TYPE_CD
+		,MAX(begin_date) OVER (
+			PARTITION BY a.client_id
+			,a.plan_id
+			,a.platform_person_internal_id
+			,a.category_id
+			) AS MAX_PP_STAT_EFBEG_DT
+	FROM wealth_rpt.person_planstatus_dim a
+	INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+		AND a.category_id = b.category_id
+		AND a.plan_id = b.plan_id
+	WHERE
+		a.platform_indicator_code IN ('R3','R4','DCE') 
+		AND b.category_type_code = 'PS'
+		AND CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE) >= a.begin_date
+		AND CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE) <= a.end_date
+		AND b.category_definition_brand_code = 'PRTC-STAT'
+		AND a.client_id =<<$pClientId>>
+		AND TRIM(UPPER(a.participation_status_code)) = 'ACTIVE'
+	)
+	,PRSN_PLANSTAT_DIMN
+AS (
+	SELECT DISTINCT CLIENT_ID
+		,PLAN_ID
+		,PRSN_INTN_ID
+	FROM PRSN_PLANSTAT_DIMN01
+	WHERE MAX_PP_STAT_EFBEG_DT = PP_STAT_EFBEG_DT
+	)
+	,person_planstat
+AS (
+	SELECT 
+		p.client_id
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,p.platform_person_internal_id
+		,d.plan_id
+	FROM prsn_planstat_dimn d
+	INNER JOIN person p ON p.client_id = d.client_id
+		AND p.platform_person_internal_id = d.prsn_intn_id
+	)
+	,person_data
+AS (
+	SELECT a.client_id
+	    ,a.client_id_string
+		,a.row_level_security_filter_value
+		,a.platform_person_internal_id
+		,a.plan_id
+		,last_day(CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE)) as reporting_month
+	FROM person_planstat a
+	INNER JOIN wealth_rpt.dc_plan_dim b 
+		ON a.client_id = b.client_id
+		AND a.plan_id = b.plan_id
+		AND b.client_id =<<$pClientId>>
+		AND b.plan_type_code = 'DC'
+		AND b.plan_brand_code <> 'DC-NON-QLFY'
+	)
+,fund_asset_mapping AS (
+	SELECT
+		client_id,
+		plan_identifier,
+		fund_identifier,
+		asset_name,
+		asset_class_identifier
+	FROM
+		wealth_rpt.dc_icb_fund_asset_mapping
+	WHERE client_id IN (<<$pClientId>>)
+		AND asset_class_identifier<>17
+		AND effective_begin_date <= CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE)
+		AND effective_end_date >= CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE)
+)
+,hard_balance_trnsfer_fund as
+    (SELECT hb.client_id AS client_id,
+		hb.plan_id AS plan_id,
+		hb.platform_person_internal_id,
+		asset.asset_class_identifier,
+		asset.asset_name,
+		SUM(managed_account_transfer_in+managed_account_transfer_out+participant_intiated_transfer_in+participant_intiated_transfer_out+auto_rebalance_transfer_in+auto_rebalance_transfer_out) AS total_transfer_dollar
+	FROM wealth_rpt.dc_hard_balance hb
+	INNER JOIN wealth_rpt.hardbalance_dim hdm 
+		ON hb.client_id = hdm.client_id
+		AND hb.plan_id = hdm.plan_id
+		AND hb.hard_balance_id = hdm.hardbalance_id
+		AND hb.fund_id = hdm.fund_id
+	INNER JOIN fund_asset_mapping asset
+		ON hdm.client_id = asset.client_id
+		AND hdm.fund_id = asset.fund_identifier
+		AND hdm.plan_id = asset.plan_identifier
+	WHERE LAST_DAY(CAST(accounting_activity_effective_date AS DATE)) = CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE)
+		AND hb.client_id = <<$pClientId>>	
+	GROUP BY 
+		hb.client_id,
+		hb.plan_id,
+		hb.platform_person_internal_id,
+		asset.asset_class_identifier,
+		asset.asset_name
+	)
+	,join_person_hard_balance_transfer
+AS (
+	SELECT 
+		p.client_id
+		,p.platform_person_internal_id
+		,p.plan_id
+		,p.reporting_month
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,c.total_transfer_dollar
+		,c.asset_name
+	FROM 
+		person_data p 
+	INNER JOIN hard_balance_trnsfer_fund c 
+		ON p.client_id = c.client_id
+		AND p.plan_id = c.plan_id
+		AND p.platform_person_internal_id = c.platform_person_internal_id		
+	)
+,asset_tranfer_dollar AS(
+	SELECT 
+		client_id
+		,reporting_month
+		,asset_name
+		,row_level_security_filter_value
+		,client_id_string
+		,SUM(total_transfer_dollar) AS total_asset_transfer_dollar
+	FROM join_person_hard_balance_transfer
+	GROUP BY
+		client_id
+		,reporting_month
+		,asset_name
+		,row_level_security_filter_value
+		,client_id_string
+	)
+,asset_tranfer_dollar_plan AS(
+	SELECT 
+		client_id
+		,reporting_month
+		,asset_name
+		,client_id_string
+		,SUM(total_transfer_dollar) AS total_asset_transfer_dollar
+	FROM join_person_hard_balance_transfer
+	GROUP BY
+		client_id
+		,reporting_month
+		,asset_name
+		,client_id_string
+	)
+,plan_tranfer_dollar AS(
+	SELECT 
+		client_id
+		,reporting_month
+		,client_id_string
+		,SUM(CASE WHEN total_asset_transfer_dollar>0 THEN total_asset_transfer_dollar END) AS total_plan_transfer_dollar
+	FROM asset_tranfer_dollar_plan
+	GROUP BY
+		client_id
+		,reporting_month
+		,client_id_string
+	)
+SELECT 
+	atd.client_id
+	,atd.reporting_month
+	,atd.asset_name
+	,atd.client_id_string
+	,atd.row_level_security_filter_value
+	,total_asset_transfer_dollar
+	,total_plan_transfer_dollar
+FROM asset_tranfer_dollar atd
+INNER JOIN plan_tranfer_dollar ptd
+	ON ptd.client_id = atd.client_id
+	AND ptd.reporting_month = atd.reporting_month

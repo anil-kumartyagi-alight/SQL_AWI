@@ -1,0 +1,546 @@
+WITH mv_person
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id, client_id_string
+		,platform_person_internal_id
+		,last_name
+		,first_name
+		,middle_name
+		,COALESCE(gender, 'Undisclosed/Not specified') AS gender
+		,birth_date
+		,person_reason_code
+		,union_name
+		,platform_id
+		,begin_date
+		,end_date
+	FROM person_rpt.person
+	WHERE person_reason_code = 'Employee'
+		AND begin_date <= (<<$pEndDate>>)
+		AND end_date >= (<<$pEndDate>>)
+		AND client_id = cast(<<$pClientId>> as int)
+	)
+	,mv_person_employment
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,platform_person_internal_id
+		,platform_id
+		,expected_annual_base_salary
+		,hourly_salary_status
+		,fulltime_parttime_status
+		,employment_status_begin_date
+		,begin_date
+		,end_date
+		,hire_date
+		,termination_date
+		,employee_id
+		,standard_employment_status
+		,standard_value AS employment_status
+FROM person_rpt.person_employment pe
+LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+	ON pe.standard_employment_status_code = rl.standard_key
+	AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+	WHERE 
+		begin_date <= (<<$pEndDate>>)
+		AND end_date >= (<<$pEndDate>>)
+		AND UPPER(TRIM(standard_value)) = 'ACTIVE'
+		AND client_id = cast(<<$pClientId>> as int)
+	)
+	, psf
+AS (
+				select * from person_itg.person_security_filter 
+				where client_id =cast(<<$pClientId>> as int) 
+					
+
+				
+				)
+				, pcf
+AS (
+				select * from person_itg.person_custom_filter 
+				where client_id =cast(<<$pClientId>> as int) 
+					and data_product = 'DC'
+					and begin_date <= (<<$pEndDate>>)
+					AND end_date >= (<<$pEndDate>>)
+				)
+	
+	,person
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+		,p.client_id, p.client_id_string
+        ,p.platform_id
+		,p.platform_person_internal_id
+		,p.last_name
+		,p.first_name
+		,p.middle_name
+		,e.employee_id
+		,e.expected_annual_base_salary
+		,e.hourly_salary_status
+		,e.fulltime_parttime_status
+		,e.standard_employment_status
+		,e.employment_status_begin_date
+		,p.person_reason_code
+		,p.union_name
+		,p.gender
+		,FLOOR(CASE 
+			WHEN p.birth_date IN (
+					'1800-01-01'
+					,'1900-01-01'
+					,'1901-01-01'
+					,'1910-01-01'
+					,'1930-01-01'
+					)
+				THEN NULL
+			ELSE ROUND(DATEDIFF(DAY, p.birth_date, (<<$pEndDate>>)) / 365.25, 2)
+			END) AS age
+		,CASE 
+			WHEN p.person_reason_code = 'Employee'
+				AND upper(e.employment_status) = 'ACTIVE'
+				THEN ROUND(DATEDIFF(DAY, e.hire_date, (<<$pEndDate>>)) / 365.25, 2)
+			WHEN p.person_reason_code = 'Employee'
+				AND upper(e.employment_status) <> 'ACTIVE'
+				AND e.termination_date IS NOT NULL
+				AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+				THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+			ELSE NULL
+			END AS tenure
+		,psf.row_level_security_filter_value
+		,pcf.custom_filter_1
+		,pcf.custom_filter_2
+		,pcf.custom_filter_3
+		,pcf.custom_filter_4
+		,pcf.custom_filter_5	
+	FROM mv_person p
+	inner JOIN mv_person_employment e ON p.client_id = e.client_id
+		AND p.platform_person_internal_id = e.platform_person_internal_id
+		AND p.platform_id = e.platform_id
+		AND p.client_id =cast(<<$pClientId>> as int)
+	left join psf on p.platform_id = psf.platform_id
+		and p.platform_person_internal_id = psf.platform_person_internal_id
+		and p.client_id = psf.client_id 				
+                
+	left join pcf on p.platform_id = pcf.platform_id
+		and p.platform_person_internal_id = pcf.platform_person_internal_id
+		and p.client_id = pcf.client_id 
+		and <<$pEndDate>> <= pcf.end_date
+		and <<$pEndDate>> >= pcf.begin_date
+	)
+	,PRSN_PLANSTAT_DIMN01
+AS (
+	SELECT a.client_id AS CLIENT_ID
+		,a.platform_person_internal_id AS PRSN_INTN_ID
+		,a.category_id AS CAT_ID
+		,a.begin_date AS PP_STAT_EFBEG_DT
+		,a.end_date AS PP_STAT_EFEND_DT
+		,a.plan_status_code AS PLAN_STAT_CD
+		,a.participation_status_code AS prtc_stat_cd
+		,a.platform_indicator_code AS PLFM_IND_CD
+		,a.plan_id AS PLAN_ID
+		,b.category_type_code AS CAT_TYPE_CD
+		,MAX(begin_date) OVER (
+			PARTITION BY a.client_id
+			,a.plan_id
+			,a.platform_person_internal_id
+			,a.category_id
+			) AS MAX_PP_STAT_EFBEG_DT
+	FROM wealth_rpt.person_planstatus_dim a
+	INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+		AND a.category_id = b.category_id
+		AND a.plan_id = b.plan_id
+	WHERE
+		a.platform_indicator_code IN ('R3','R4','DCE') 
+		AND b.category_type_code = 'PS'
+		AND (<<$pEndDate>>) >= a.begin_date
+		AND (<<$pEndDate>>) <= a.end_date
+		AND b.category_definition_brand_code = 'PRTC-STAT'
+		AND a.client_id =cast(<<$pClientId>> as int)
+	)
+	,PRSN_PLANSTAT_DIMN
+AS (
+	SELECT DISTINCT CLIENT_ID
+		,PLAN_ID
+		,CAT_ID
+		,PRSN_INTN_ID
+		,prtc_stat_cd
+		,plfm_ind_cd
+		--,CAT_TYPE_CD
+		,MAX_PP_STAT_EFBEG_DT
+	FROM PRSN_PLANSTAT_DIMN01
+	WHERE MAX_PP_STAT_EFBEG_DT = PP_STAT_EFBEG_DT
+		AND UPPER(prtc_stat_cd) IN ('ACTIVE','ELIG')
+	)
+	,person_planstat
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+        ,p.platform_id
+		,p.client_id, p.client_id_string
+		,p.platform_person_internal_id
+		,p.last_name
+		,p.first_name
+		,p.middle_name
+		,p.employee_id
+		,p.expected_annual_base_salary
+		,p.hourly_salary_status
+		,p.fulltime_parttime_status
+		,p.person_reason_code
+		,p.union_name
+		,p.gender
+		,p.standard_employment_status
+		,p.employment_status_begin_date
+		,floor(p.age) as age
+		,floor(p.tenure) as tenure
+		,d.prtc_stat_cd
+		,d.plfm_ind_cd
+		,d.plan_id
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	FROM prsn_planstat_dimn d
+	INNER JOIN person p ON p.client_id = d.client_id
+		AND p.platform_person_internal_id = d.prsn_intn_id
+	--WHERE d.plfm_ind_cd = 'R4'
+		--AND UPPER(TRIM(p.employment_status)) in ('TERMINATION','ACTIVE')
+		--AND UPPER(TRIM(prtc_stat_cd)) = 'ACTIVE'
+	)
+	,dc_plan_dimn
+AS (
+	SELECT client_id
+		,plan_brand_code as plan_brnd_cd
+		,plan_long_description as plan_ldsc_tx
+		,plan_type_code as plan_type_cd
+		,plan_id
+	FROM wealth_rpt.dc_plan_dim
+	WHERE client_id =cast(<<$pClientId>> as int)
+		AND plan_type_code = 'DC'
+	)
+	,person_data
+AS (
+	SELECT a.client_id, a.client_id_string
+		,a.platform_person_internal_id
+        ,a.platform_id
+		,a.last_name
+		,a.first_name
+		,a.middle_name
+		,a.employee_id
+		,a.expected_annual_base_salary AS salary
+		,a.hourly_salary_status
+		,a.fulltime_parttime_status
+		,a.person_reason_code
+		,a.union_name
+		,a.gender
+		,a.standard_employment_status
+		,a.employment_status_begin_date
+		,a.age
+		,a.tenure
+		,a.prtc_stat_cd
+		,a.plfm_ind_cd
+		,a.plan_id
+		,b.plan_brnd_cd
+		,b.plan_ldsc_tx
+		,b.plan_type_cd
+		,a.row_level_security_filter_value
+		,a.custom_filter_1
+		,a.custom_filter_2
+		,a.custom_filter_3
+		,a.custom_filter_4
+		,a.custom_filter_5
+	FROM person_planstat a
+	LEFT JOIN dc_plan_dimn b ON a.client_id = b.client_id
+		AND a.plan_id = b.plan_id
+	WHERE b.plan_type_cd = 'DC'
+	)
+	,range_lookup
+AS (
+	SELECT standard_group_key
+		,standard_display_name
+		,standard_min
+		,standard_max
+		,OWNER
+	FROM adlfound_itg.standard_ranges_lookup
+	)
+	,dc_person_attributes
+AS (
+	SELECT a.client_id, a.client_id_string
+		,a.platform_person_internal_id
+        ,a.platform_id
+		,a.last_name
+		,a.first_name
+		,a.middle_name
+		,a.employee_id
+		,a.hourly_salary_status
+		,a.fulltime_parttime_status
+		,a.person_reason_code
+		,a.union_name
+		,a.gender
+		,a.standard_employment_status
+		,a.employment_status_begin_date
+		,a.prtc_stat_cd
+		,a.plfm_ind_cd
+		,a.plan_id
+		,a.plan_brnd_cd
+		,a.plan_ldsc_tx
+		,a.plan_type_cd
+		,a.age
+		,B.standard_display_name
+		,B.standard_display_name AS AGE_RANGE
+		,a.TENURE
+		,C.standard_display_name AS TENURE_RANGE
+		,a.salary
+		,D.standard_display_name AS SALARY_RANGE
+		,a.row_level_security_filter_value
+		,a.custom_filter_1
+		,a.custom_filter_2
+		,a.custom_filter_3
+		,a.custom_filter_4
+		,a.custom_filter_5
+	FROM person_data a
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'AGE_RANGE_DC'
+		) b ON floor(a.age) between b.standard_min AND b.standard_max 
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'TENURE'
+		) C ON floor(a.tenure) between C.standard_min AND C.standard_max 
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+		) D ON floor(a.salary) between D.standard_min AND D.standard_max 
+	)
+	,hard_balance
+AS (
+	SELECT dhb.client_id
+		,dhb.plan_id
+		,dhb.platform_person_internal_id
+		,SUM(dhb.closing_units*bs.daily_price) AS plan_balance
+	FROM wealth_rpt.dc_hard_balance dhb
+	INNER JOIN wealth_rpt.buysell_fund_prices bs
+		ON dhb.client_id = bs.client_id 
+		AND dhb.fund_id = bs.fund_id
+	WHERE dhb.begin_date <= <<$pEndDate>>
+		AND dhb.end_date >= <<$pEndDate>>
+		AND bs.effective_date = <<$pEndDate>>
+		AND dhb.closing_units > 0
+		AND dhb.client_id = cast(<<$pClientId>> as int)
+	GROUP BY dhb.client_id
+		,dhb.plan_id
+		,dhb.platform_person_internal_id
+	)
+	,join_person_balance
+AS (
+	SELECT DISTINCT p.client_id, p.client_id_string
+		,p.platform_person_internal_id
+        ,p.platform_id
+		,p.last_name
+		,p.first_name
+		,p.middle_name
+		,p.employee_id
+		,p.person_reason_code
+		,p.salary
+		,p.SALARY_RANGE
+		,p.hourly_salary_status
+		,p.prtc_stat_cd
+		,p.standard_employment_status
+		,p.employment_status_begin_date
+		,p.fulltime_parttime_status
+		,p.union_name
+		,p.gender
+		,p.age
+		,p.AGE_RANGE
+		,p.tenure
+		,p.TENURE_RANGE
+		,p.plan_id
+		,p.plan_ldsc_tx
+		,p.plan_type_cd
+		,NVL(ROUND(b.plan_balance,2),0) AS plan_balance
+		,CAST(<<$pEndDate>> AS DATE) as reporting_month
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	FROM dc_person_attributes p
+	LEFT OUTER JOIN hard_balance b 
+		ON p.client_id = b.client_id
+		AND p.plan_id = b.plan_id
+		AND p.platform_person_internal_id = b.platform_person_internal_id
+	)
+	,dc_contributions
+AS (
+	SELECT 
+		client_id,
+		plan_id,
+		platform_person_internal_id,
+		SUM(auto_escalation_percent) AS auto_escalation_percent,
+		SUM(auto_escalation_amount) AS auto_escalation_amount,
+		SUM(auto_escalation_target_percent) AS Auto_Escalation_Max,
+		SUM(CASE
+                WHEN contributions.contribution_rate_type_code IN ('AT','BT','RT') THEN actual_contribution_rate END
+			) as actual_contribution_rate,
+		SUM(actual_contribution_amount) AS actual_contribution_amount,
+		SUM(CASE
+                WHEN contributions.contribution_rate_type_code = 'BT' THEN contributions.actual_contribution_rate ELSE 0
+            END) AS Before_Tax_Contributions_Rate,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'AT' THEN contributions.actual_contribution_rate ELSE 0
+				END) AS After_Tax_Contributions_Rate,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'RT' THEN contributions.actual_contribution_rate ELSE 0
+				END) AS Roth_Contributions_Rate,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'CR' THEN contributions.actual_contribution_amount ELSE 0
+				END) AS Catch_Up_Roth_Contributions_Dollars,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'CR' THEN contributions.actual_contribution_rate ELSE 0
+				END) AS Catch_Up_Roth_Contributions_Rate,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'CU' THEN contributions.actual_contribution_amount ELSE 0
+				END) AS Catch_Up_Contributions_Dollars,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'CU' THEN contributions.actual_contribution_rate ELSE 0
+				END) AS Catch_Up_Contributions_Rate,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'BT' THEN contributions.actual_contribution_amount ELSE 0
+				END) AS Before_Tax_Contributions_Dollars,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'AT' THEN contributions.actual_contribution_amount
+					ELSE 0
+				END) AS After_Tax_Contributions_Dollars,
+		SUM(CASE
+				WHEN contributions.contribution_rate_type_code = 'RT' THEN contributions.actual_contribution_amount
+					ELSE 0
+				END) AS Roth_Contributions_Dollars,
+		MAX(CASE
+				WHEN contributions.contribution_rate_type_code = 'BT' THEN contributions.begin_date
+				END) AS Before_Tax_Contribution_Rate_Effective_Date,
+		MAX(CASE
+				WHEN contributions.contribution_rate_type_code = 'AT' THEN contributions.begin_date
+				END) AS After_Tax_Contribution_Rate_Effective_Date,
+		MAX(CASE
+					WHEN contributions.contribution_rate_type_code = 'RT' THEN contributions.begin_date
+				END) AS Roth_Contribution_Rate_Effective_Date
+	FROM wealth_itg.dc_contributions contributions
+	WHERE 1 = 1
+		AND begin_date <= <<$pEndDate>>
+		AND end_date >= <<$pEndDate>>
+	GROUP BY 
+		client_id,
+		plan_id,
+		platform_person_internal_id
+	)
+	,join_person_contributions
+AS (
+	SELECT 
+		p.client_id, p.client_id_string
+		--,ltrim(to_char(p.client_id,'99999')) as client_id_string
+		,p.platform_person_internal_id
+        ,p.platform_id
+		,p.last_name
+		,p.first_name
+		,p.middle_name
+		,p.employee_id
+		,p.person_reason_code AS person_type
+		,p.salary
+		,p.SALARY_RANGE
+		,p.hourly_salary_status
+		,p.prtc_stat_cd AS plan_status
+		,p.standard_employment_status as employment_status
+		,p.employment_status_begin_date
+		,p.fulltime_parttime_status
+		,p.union_name
+		,p.gender
+		,p.age
+		,p.tenure AS Length_of_Employment
+		,p.AGE_RANGE
+		,p.TENURE_RANGE AS Length_of_Employment_Range
+		,p.plan_id
+		,p.plan_ldsc_tx AS Plan_name
+		,p.plan_balance
+		,CASE
+		 WHEN p.plan_balance != 0 THEN 'Exclude Zero'
+		 ELSE 'Include Zero'
+		 END AS plan_balance_incl_excl
+		,p.reporting_month
+		,NVL(contributions.auto_escalation_percent,0) AS auto_escalation_percent
+		,NVL(contributions.auto_escalation_amount,0) AS auto_escalation_amount
+		,CASE WHEN auto_escalation_percent > 0 OR contributions.auto_escalation_amount > 0
+			THEN 'Y' ELSE 'N'
+			END AS Using_Auto_Escalation
+		,NVL(contributions.auto_escalation_percent,0) AS auto_escalation_increment
+		,NVL(Auto_Escalation_Max,0) AS Auto_Escalation_Max
+		,NVL(contributions.actual_contribution_rate,0) AS actual_contribution_rate
+		,NVL(contributions.actual_contribution_amount,0) AS actual_contribution_amount
+		,contributions.Before_Tax_Contributions_Rate AS Before_Tax_Contributions_Rate
+		,contributions.After_Tax_Contributions_Rate AS After_Tax_Contributions_Rate
+		,contributions.Roth_Contributions_Rate AS Roth_Contributions_Rate
+		,NVL(contributions.Catch_Up_Roth_Contributions_Dollars,0) AS Catch_Up_Roth_Contributions_Dollars
+		,contributions.Catch_Up_Roth_Contributions_Rate AS Catch_Up_Roth_Contributions_Rate
+		,NVL(contributions.Catch_Up_Contributions_Dollars,0) AS Catch_Up_Contributions_Dollars
+		,contributions.Catch_Up_Contributions_Rate AS Catch_Up_Contributions_Rate
+		,NVL(contributions.Before_Tax_Contributions_Dollars,0) AS Before_Tax_Contributions_Dollars
+		,NVL(contributions.After_Tax_Contributions_Dollars,0) AS After_Tax_Contributions_Dollars
+		,NVL(contributions.Roth_Contributions_Dollars,0) AS Roth_Contributions_Dollars
+		,contributions.Before_Tax_Contribution_Rate_Effective_Date
+		,contributions.After_Tax_Contribution_Rate_Effective_Date
+		,contributions.Roth_Contribution_Rate_Effective_Date
+		,CASE
+			WHEN contributions.actual_contribution_rate = 1 THEN '1'
+			WHEN contributions.actual_contribution_rate BETWEEN 1 AND 2 THEN '2'
+			WHEN contributions.actual_contribution_rate BETWEEN 2 AND 3 THEN '3'
+			WHEN contributions.actual_contribution_rate BETWEEN 3 AND 4 THEN '4'
+			WHEN contributions.actual_contribution_rate BETWEEN 4 AND 5 THEN '5'
+			WHEN contributions.actual_contribution_rate BETWEEN 5 AND 6 THEN '6'
+			WHEN contributions.actual_contribution_rate BETWEEN 6 AND 10 THEN '7-10'
+			WHEN contributions.actual_contribution_rate BETWEEN 10 AND 14 THEN '11-14'
+			WHEN contributions.actual_contribution_rate BETWEEN 14 AND 19 THEN '15-19'
+			WHEN contributions.actual_contribution_rate > 19 THEN '20+'
+		END AS Contribution_Rate_Distribution_Grouping
+		,CASE
+			WHEN icb.match_threshold_percent > NVL(contributions.actual_contribution_rate, 0)
+			THEN 'Below'
+			WHEN icb.match_threshold_percent < NVL(contributions.actual_contribution_rate, 0)
+			THEN 'Above'
+			WHEN icb.match_threshold_percent = NVL(contributions.actual_contribution_rate, 0)
+			THEN 'Equal'
+			ELSE 'NA'
+		END AS Match_Status
+		,CASE
+			WHEN contributions.actual_contribution_rate > 0 OR contributions.actual_contribution_amount > 0
+			THEN 'Contributing'
+			ELSE 'Not Contributing'
+		END AS Participating
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	FROM 
+		join_person_balance p 
+		LEFT JOIN dc_contributions contributions 
+		ON p.client_id = contributions.client_id
+		AND p.plan_id = contributions.plan_id
+		AND p.platform_person_internal_id = contributions.platform_person_internal_id	
+		LEFT JOIN wealth_itg.dc_icb_plan_dim icb
+		ON p.client_id=icb.client_id
+		AND p.plan_id=icb.plan_id
+		AND icb.reporting_year=EXTRACT(YEAR FROM (CAST(<<$pEndDate>> AS DATE)))
+	),
+
+    	
+main AS (
+	SELECT * from join_person_contributions
+)
+
+-- Final output
+SELECT * FROM main

@@ -1,0 +1,148 @@
+WITH Exp_db_cmnct_fact_detail AS (
+    SELECT DISTINCT
+        platform_id AS platform_id,
+        client_id AS client_id, client_id_string, row_level_security_filter_value, 
+        platform_person_internal_id AS person_internal_id,
+		activity_initiated_cst_ts AS event_start_timestamp,
+        intent_retire_activity_completed_cst_ts AS iret_event_end_timestamp,
+        commencement_result_elapsed_days AS elapsed_time_in_days,
+		trim(commencement_status) AS event_status
+		FROM wealth_rpt.db_commencement db_commencement_detail
+    WHERE  client_id = ( cast(<<$pClientId>> as int)) AND 
+	convert_timezone('CST', 'UTC', activity_initiated_cst_ts) >= '1800-01-01'
+),
+
+Exp_cmnct_of_benefit_init_comm AS (
+SELECT DISTINCT platform_id, client_id, client_id_string, row_level_security_filter_value, person_internal_id, 
+event_start_timestamp AS reporting_month_date,
+'Initiated Commencement' AS summary_dimension_value,
+'commencement_of_benefit' AS summary_dimension_type
+FROM Exp_db_cmnct_fact_detail
+),
+
+Exp_cmnct_of_benefit_cplt_comm AS (
+SELECT DISTINCT platform_id, client_id, client_id_string, row_level_security_filter_value, person_internal_id, 
+iret_event_end_timestamp AS reporting_month_date,
+'Completed Commencement' AS summary_dimension_value,
+'commencement_of_benefit' AS summary_dimension_type
+FROM Exp_db_cmnct_fact_detail
+WHERE trim(event_status) = 'DB-ACEL'
+),
+
+Un_elpsed_cmnct_count_smry AS (
+SELECT DISTINCT platform_id, client_id, client_id_string, row_level_security_filter_value, person_internal_id, 
+reporting_month_date,summary_dimension_value,summary_dimension_type 
+FROM Exp_cmnct_of_benefit_init_comm
+UNION ALL
+SELECT DISTINCT platform_id, client_id, client_id_string, row_level_security_filter_value, person_internal_id, 
+reporting_month_date,summary_dimension_value,summary_dimension_type
+FROM Exp_cmnct_of_benefit_cplt_comm
+),
+
+join_plan_prsn_atrb_comnc_fact AS (
+    SELECT DISTINCT
+        a.platform_id,
+        a.client_id, a.client_id_string, a.row_level_security_filter_value,
+        a.person_internal_id,
+        a.summary_dimension_type,
+		a.summary_dimension_value,
+        LAST_DAY(cast(a.reporting_month_date as date)) AS reporting_month_date,
+		CASE WHEN nvl(trim(b.employment_status),'') IS NULL then 'NA' else nvl(trim(b.employment_status),'') END AS  employment_status
+		FROM Un_elpsed_cmnct_count_smry a
+    INNER JOIN person_rpt.person_employment b ON a.platform_id = b.platform_id 
+        AND a.client_id = b.client_id
+        AND a.person_internal_id = b.platform_person_internal_id 
+		AND last_day(a.reporting_month_date) >= CAST(b.begin_date AS DATE)
+        AND last_day(a.reporting_month_date) <= CAST(b.end_date AS DATE)
+		WHERE  b.client_id = ( cast(<<$pClientId>> as int)) 
+),
+
+Exp_elpsed_time_cmnct_smry_distinct_count as (
+SELECT
+platform_id,
+client_id, client_id_string, row_level_security_filter_value,
+summary_dimension_type,
+summary_dimension_value,
+reporting_month_date,
+employment_status as empl_stat,
+count(distinct person_internal_id) AS employee_distinct_count_month
+from join_plan_prsn_atrb_comnc_fact
+group by 1,2,3,4,5,6,7,8
+),
+
+exp_average_elp_days_cmnct_days  as (SELECT
+platform_id,
+client_id, client_id_string, row_level_security_filter_value,
+NVL(TRIM(summary_dimension_type), '') AS smry_dimn_type,
+NVL(TRIM(summary_dimension_value), '') AS smry_dimn_value,
+empl_stat,
+CAST(employee_distinct_count_month AS INT) AS employee_distinct_count_month,
+reporting_month_date  AS reporting_month_dt
+from Exp_elpsed_time_cmnct_smry_distinct_count
+),
+
+SQ0_Qry_Commencement_Percent AS (SELECT client_id, client_id_string, row_level_security_filter_value, 
+        smry_dimn_value AS Dimension_Value, 
+        reporting_month_dt AS Reporting_Month_Date, 
+        SUM(CASE WHEN employee_distinct_count_month IS NULL then 0 else employee_distinct_count_month END) AS Employee_Distinct_Count_Month
+    FROM
+        exp_average_elp_days_cmnct_days
+	WHERE 
+        smry_dimn_value <> 'unknown' AND
+         LAST_DAY(cast(reporting_month_dt as date)) between LAST_DAY(ADD_MONTHS(CURRENT_DATE, -13)) and  LAST_DAY(ADD_MONTHS(CURRENT_DATE, -1)) 
+        AND
+        -- cast(reporting_month_dt as date)= '2023-06-30' AND
+        smry_dimn_type = 'commencement_of_benefit' AND
+        (('All' IS NULL OR
+        'All' IN ( 
+            'ACTIVE', 
+            'INACTIVE', 
+            'ACTIVE', 
+            'INACTIVE', 
+            'All' )) AND
+        1 = 1 OR
+        CASE 
+            WHEN 
+                UPPER(empl_stat) IN ( 
+                    'INACTIVE', 
+                    'NON-EMPLOYEE' )
+                THEN
+                    'INACTIVE'
+            WHEN 
+                UPPER(empl_stat) IN ( 
+                    'ACTIVE' )
+                THEN
+                    'ACTIVE'
+        END IS NULL OR
+        CASE 
+            WHEN 
+                UPPER(empl_stat) IN ( 
+                    'INACTIVE', 
+                    'NON-EMPLOYEE' )
+                THEN
+                    'INACTIVE'
+            WHEN 
+                UPPER(empl_stat) IN ( 
+                    'ACTIVE' )
+                THEN
+                    'ACTIVE'
+        END IN ( 
+            'ACTIVE', 
+            'INACTIVE', 
+            'ACTIVE', 
+            'INACTIVE', 
+            'All' )) 
+    GROUP BY client_id, client_id_string, row_level_security_filter_value, smry_dimn_value,reporting_month_dt
+	)
+
+SELECT
+    client_id, client_id_string, row_level_security_filter_value,
+	-- ltrim(to_char(client_id,'99999'))  client_id_string,
+	Dimension_Value AS Dimension_Value, 
+    SUM(Employee_Distinct_Count_Month) AS Employee_Distinct_Count_Month, 
+    Reporting_Month_Date AS Reporting_Month_Date
+FROM
+    SQ0_Qry_Commencement_Percent
+	group by client_id, client_id_string, row_level_security_filter_value, Dimension_Value,
+
+	Reporting_Month_Date

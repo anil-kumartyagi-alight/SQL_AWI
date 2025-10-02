@@ -1,0 +1,233 @@
+WITH mv_person
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,client_id_string
+		,platform_id
+		,begin_date
+		,end_date
+		,platform_person_internal_id
+		, gender
+		,birth_date
+		,person_reason_code
+		,union_name
+	FROM person_rpt.person
+	WHERE 
+	--person_reason_code = 'Employee'		AND 
+	begin_date <= (<<$pEndDate>>)
+		AND end_date >= (<<$pEndDate>>)
+		AND client_id =(cast(<<$pClientId>> as int) )
+	)
+	,mv_person_employment
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,platform_person_internal_id
+		,platform_id
+		,expected_annual_base_salary
+		,hourly_salary_status
+		,fulltime_parttime_status
+		,standard_value AS employment_status
+		,hire_date
+		,termination_date
+	FROM person_rpt.person_employment
+	LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+		ON person_employment.standard_employment_status_code = rl.standard_key
+		AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+	WHERE 
+	--upper(trim(employment_status)) = 'ACTIVE'AND 
+	begin_date <= (<<$pEndDate>>)
+		AND end_date >= (<<$pEndDate>>)
+		AND client_id =cast(<<$pClientId>> as int) 
+	)
+					, psf
+AS (
+				select * from person_itg.person_security_filter 
+				where client_id =cast(<<$pClientId>> as int) 
+
+				
+				)
+				, pcf
+AS (
+				select * from person_itg.person_custom_filter 
+				where client_id =cast(<<$pClientId>> as int) 
+				and data_product = 'DB'
+				)
+	,person
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+		,p.client_id
+		,p.client_id_string
+		,p.platform_person_internal_id
+		,e.expected_annual_base_salary
+		,e.hourly_salary_status
+		,e.fulltime_parttime_status
+		,e.employment_status
+		,p.person_reason_code
+		,p.union_name
+		,p.gender
+		,FLOOR(CASE 
+			WHEN p.birth_date IN (
+					'1800-01-01'
+					,'1900-01-01'
+					,'1901-01-01'
+					,'1910-01-01'
+					,'1930-01-01'
+					)
+				THEN NULL
+			ELSE ROUND(DATEDIFF(DAY, p.birth_date, (<<$pEndDate>>)) / 365.25, 2)
+			END) AS age
+		,CASE 
+			WHEN p.person_reason_code = 'Employee'
+				AND upper(e.employment_status) = 'ACTIVE'
+				THEN ROUND(DATEDIFF(DAY, e.hire_date, (<<$pEndDate>>)) / 365.25, 2)
+			WHEN p.person_reason_code = 'E'
+				AND upper(e.employment_status) <> 'ACTIVE'
+				AND e.termination_date IS NOT NULL
+				AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+				THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+			ELSE NULL
+			END AS tenure
+			,psf.row_level_security_filter_value,
+    pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5	
+	FROM mv_person p
+	LEFT JOIN mv_person_employment e ON p.client_id = e.client_id
+		AND p.platform_person_internal_id = e.platform_person_internal_id
+		AND p.platform_id = e.platform_id
+		--AND p.global_client_id = e.global_client_id
+		--AND p.global_person_id = e.global_person_id
+		AND p.client_id =cast(<<$pClientId>> as int) 
+	left join psf on p.platform_id = psf.platform_id
+								and p.platform_person_internal_id = psf.platform_person_internal_id
+								and p.client_id = psf.client_id 				
+                
+	left join pcf on p.platform_id = pcf.platform_id
+								and p.platform_person_internal_id = pcf.platform_person_internal_id
+								and p.client_id = pcf.client_id 
+								and <<$pEndDate>> <= pcf.end_date
+								and <<$pEndDate>> >= pcf.begin_date
+	)
+	,range_lookup
+AS (
+	SELECT standard_group_key
+		,standard_display_name standard_display_value
+		,standard_min
+		,standard_max
+		,OWNER
+	FROM adlfound_itg.standard_ranges_lookup
+	)
+	,person_attributes
+AS (
+	SELECT a.client_id
+	     ,a.client_id_string
+		,a.platform_person_internal_id
+		,a.hourly_salary_status
+		,a.fulltime_parttime_status
+		,a.person_reason_code
+		,a.union_name
+		,a.gender
+		,a.employment_status
+		,a.age
+		,B.standard_display_value AS AGE_RANGE
+		,a.TENURE
+		,C.standard_display_value AS TENURE_RANGE
+		,a.expected_annual_base_salary as salary
+		,D.standard_display_value AS SALARY_RANGE
+		, a.row_level_security_filter_value,
+    a.custom_filter_1, a.custom_filter_2, a.custom_filter_3, a.custom_filter_4, a.custom_filter_5	
+	FROM person a
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'AGE_RANGE_DB'
+		) b ON floor(a.age) between b.standard_min AND b.standard_max
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'TENURE'
+		) C ON floor(a.tenure) between C.standard_min AND C.standard_max 
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+		) D ON floor(a.expected_annual_base_salary) between D.standard_min AND D.standard_max 
+	)
+, query_db_payments
+As (
+select client_id,payment_id, payment_effective_date, plan,plan_id,payment_type, payment_destination,total_payment_amount,platform_person_internal_id,
+ CASE WHEN (
+                ROW_NUMBER()
+                    OVER(
+                        PARTITION BY payment_id, plan_id, CAST(EXTRACT(YEAR FROM payment_effective_date) as INTEGER), platform_person_internal_id
+                            
+                        ORDER BY
+                           payment_id asc, plan_id asc, CAST(EXTRACT(YEAR FROM payment_effective_date) as INTEGER) asc, platform_person_internal_id asc
+                    )) = 1
+                THEN
+                    platform_person_internal_id
+            ELSE NULL END
+as count_LA		
+from wealth_rpt.db_payments where 
+client_id=cast(<<$pClientId>> as int) and 
+payment_effective_date between <<$pBeginDate>> and <<$pEndDate>>
+and total_payment_amount>0
+-- and payment_destination<>'NA' 
+and payment_type<>'NA'
+)
+
+
+    SELECT
+        query_db_payments.client_id,
+		person_attributes.client_id_string,
+		--ltrim(to_char(query_db_payments.client_id,'99999')) as client_id_string, 
+		case when query_db_payments.payment_destination='Drct_Dpst' then 'Direct Deposit'
+		when query_db_payments.payment_destination='Paper_Chk' then 'Paper Payments' 
+		when query_db_payments.payment_destination='Rlvrs' then 'Rollovers'
+		when query_db_payments.payment_destination='Dflt_Rlvr' then 'Default Rollovers'
+		end as payment_destination,
+		query_db_payments.payment_type,
+		sum(query_db_payments.total_payment_amount) Payment_amount,
+		query_db_payments.payment_effective_date,
+--COUNT(DISTINCT(CONCAT(CONCAT(CONCAT(query_db_payments.platform_person_internal_id,query_db_payments.payment_id),query_db_payments.plan_id),query_db_payments.payment_effective_date)) ) 
+count(count_LA) as Tot_ppt,
+        query_db_payments.plan_id,
+		query_db_payments.plan,
+        person_attributes.hourly_salary_status,
+		person_attributes.employment_status,
+        person_attributes.fulltime_parttime_status,
+        person_attributes.union_name,
+        person_attributes.gender,
+        person_attributes.age_range,
+        person_attributes.salary_range,
+        person_attributes.tenure_range,
+		person_attributes.row_level_security_filter_value,
+   person_attributes.custom_filter_1,person_attributes.custom_filter_2,person_attributes.custom_filter_3,person_attributes.custom_filter_4,person_attributes.custom_filter_5	
+		from
+		query_db_payments inner join person_attributes  on
+		 query_db_payments.client_id = person_attributes.client_id
+		AND query_db_payments.platform_person_internal_id = person_attributes.platform_person_internal_id
+		group by 
+		query_db_payments.client_id,
+		person_attributes.client_id_string,
+        query_db_payments.plan,
+        person_attributes.hourly_salary_status,
+        person_attributes.fulltime_parttime_status,
+        person_attributes.union_name,
+        person_attributes.gender,
+        person_attributes.age_range,
+        person_attributes.salary_range,
+        person_attributes.tenure_range,
+		query_db_payments.payment_type,
+		case when query_db_payments.payment_destination='Drct_Dpst' then 'Direct Deposit'
+		when query_db_payments.payment_destination='Paper_Chk' then 'Paper Payments' 
+		when query_db_payments.payment_destination='Rlvrs' then 'Rollovers'
+		when query_db_payments.payment_destination='Dflt_Rlvr' then 'Default Rollovers'
+		end,
+		query_db_payments.plan_id,
+		person_attributes.employment_status,
+		query_db_payments.payment_effective_date,
+		person_attributes.row_level_security_filter_value,
+   person_attributes.custom_filter_1,person_attributes.custom_filter_2,person_attributes.custom_filter_3,person_attributes.custom_filter_4,person_attributes.custom_filter_5

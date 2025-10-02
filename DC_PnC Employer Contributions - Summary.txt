@@ -1,0 +1,437 @@
+--begin_date = '2024-12-01'
+--end_date = <<$pAsOfDate>>
+WITH mv_person
+AS (
+                SELECT DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id
+								,client_id_string
+                                ,platform_person_internal_id
+                                ,gender
+                                ,birth_date
+                                ,person_reason_code
+                                ,union_name
+								,platform_id
+                FROM person_rpt.person
+                WHERE person_reason_code = 'Employee'
+                                AND begin_date <= last_day(<<$pAsOfDate>>)
+                                AND end_date >= last_day(<<$pAsOfDate>>)
+                                AND client_id = <<$pClientId>>
+                )
+                ,mv_person_employment
+AS (
+                SELECT DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id
+                                ,platform_person_internal_id
+                                ,platform_id
+                                ,expected_annual_base_salary
+                                ,hourly_salary_status
+                                ,fulltime_parttime_status
+                                --,employment_status
+                                ,begin_date
+                                ,end_date
+                                ,hire_date
+                                ,termination_date
+                                ,standard_value AS employment_status
+                FROM person_rpt.person_employment pe
+                LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl ON pe.standard_employment_status_code = rl.standard_key
+                                AND standard_group_key IN ('EMPL-STAT-CD-ROLLUP1')
+                WHERE begin_date <= last_day(<<$pAsOfDate>>)
+                                AND end_date >= last_day(<<$pAsOfDate>>)
+                                AND client_id = <<$pClientId>>
+                )
+		,psf 
+AS (
+	select * from person_itg.person_security_filter 
+			 where client_id =cast(<<$pClientId>> as int) 				
+)
+                ,person
+AS (
+                SELECT p.global_client_id
+                                ,p.global_person_id
+                                ,p.client_id
+								,p.client_id_string
+                                ,p.platform_person_internal_id
+                                ,e.expected_annual_base_salary
+                                ,e.hourly_salary_status
+                                ,e.fulltime_parttime_status
+                                ,e.employment_status
+                                ,p.person_reason_code
+                                ,p.union_name
+                                ,p.gender
+                                ,floor(CASE 
+                                                WHEN p.birth_date IN (
+                                                                                '1800-01-01'
+                                                                                ,'1900-01-01'
+                                                                                ,'1901-01-01'
+                                                                                ,'1910-01-01'
+                                                                                ,'1930-01-01'
+                                                                                )
+                                                                THEN NULL
+                                                ELSE ROUND(DATEDIFF(DAY, p.birth_date, last_day(<<$pAsOfDate>>)) / 365.25, 2)
+                                                END) AS age
+                                ,CASE 
+                                                WHEN p.person_reason_code = 'Employee'
+                                                                AND upper(e.employment_status) = 'ACTIVE'
+                                                                THEN ROUND(DATEDIFF(DAY, e.hire_date, last_day(<<$pAsOfDate>>)) / 365.25, 2)
+                                                WHEN p.person_reason_code = 'Employee'
+                                                                AND upper(e.employment_status) <> 'ACTIVE'
+                                                                AND e.termination_date IS NOT NULL
+                                                                AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+                                                                THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+                                                ELSE NULL
+                                                END AS tenure
+								,row_level_security_filter_value
+								,pcf.custom_filter_1
+								,pcf.custom_filter_2
+								,pcf.custom_filter_3
+								,pcf.custom_filter_4
+								,pcf.custom_filter_5
+                FROM mv_person p
+                INNER JOIN mv_person_employment e ON p.client_id = e.client_id
+                                AND p.platform_person_internal_id = e.platform_person_internal_id
+                                AND p.platform_id = e.platform_id
+                                --AND p.global_client_id = e.global_client_id
+                                --AND p.global_person_id = e.global_person_id
+                                AND p.client_id IN (<<$pClientId>>)
+                                --WHERE UPPER(trim(e.employment_status)) = 'ACTIVE'
+				left join psf on p.platform_id = psf.platform_id
+					and p.platform_person_internal_id = psf.platform_person_internal_id
+					and p.client_id = psf.client_id 
+				
+				left join person_itg.person_custom_filter pcf on p.platform_id = pcf.platform_id
+					and p.platform_person_internal_id = pcf.platform_person_internal_id
+					and p.client_id = pcf.client_id
+					and <<$pAsOfDate>> <= pcf.end_date
+					and <<$pAsOfDate>> >= pcf.begin_date
+					--and pcf.client_id =cast(<<$pClientId>> as int)
+					and pcf.client_id =cast(<<$pClientId>> as int)	
+					and pcf.data_product = 'DC'
+				
+                )
+                ,PRSN_PLANSTAT_DIMN01
+AS (
+                SELECT a.client_id AS CLIENT_ID
+                                ,a.platform_person_internal_id AS PRSN_INTN_ID
+                                ,a.category_id AS CAT_ID
+                                ,a.begin_date AS PP_STAT_EFBEG_DT
+                                ,a.end_date AS PP_STAT_EFEND_DT
+                                ,a.plan_status_code AS PLAN_STAT_CD
+                                ,a.participation_status_code AS prtc_stat_cd
+                                ,a.platform_indicator_code AS PLFM_IND_CD
+                                ,a.plan_id AS PLAN_ID
+                                ,b.category_type_code AS CAT_TYPE_CD
+                                ,MAX(begin_date) OVER (
+                                                PARTITION BY a.client_id
+                                                ,a.plan_id
+                                                ,a.platform_person_internal_id
+                                                ,a.category_id
+                                                ) AS MAX_PP_STAT_EFBEG_DT
+                FROM wealth_rpt.person_planstatus_dim a
+                INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+                                AND a.category_id = b.category_id
+                                AND a.plan_id = b.plan_id
+                WHERE a.platform_indicator_code IN (
+                                                'R3'
+                                                ,'R4'
+                                                ,'DCE'
+                                                )
+                                AND b.category_type_code = 'PS'
+                                AND last_day(<<$pAsOfDate>>) >= a.begin_date
+                                AND last_day(<<$pAsOfDate>>) <= a.end_date
+                                AND b.category_definition_brand_code = 'PRTC-STAT'
+                                AND a.client_id IN (<<$pClientId>>)
+                )
+                ,PRSN_PLANSTAT_DIMN
+AS (
+                SELECT DISTINCT CLIENT_ID
+                                ,PLAN_ID
+                                ,CAT_ID
+                                ,PRSN_INTN_ID
+                                ,prtc_stat_cd
+                                ,plfm_ind_cd
+                                ,PLAN_STAT_CD
+                                --,CAT_TYPE_CD
+                                ,MAX_PP_STAT_EFBEG_DT
+                FROM PRSN_PLANSTAT_DIMN01
+                WHERE MAX_PP_STAT_EFBEG_DT = PP_STAT_EFBEG_DT
+                )
+                ,person_planstat
+AS (
+                SELECT p.global_client_id
+                                ,p.global_person_id
+                                ,p.client_id
+								,p.client_id_string
+                                ,p.platform_person_internal_id
+                                ,p.expected_annual_base_salary
+                                ,p.hourly_salary_status
+                                ,p.fulltime_parttime_status
+                                ,p.person_reason_code
+                                ,p.union_name
+                                ,p.gender
+                                ,p.employment_status
+                                ,p.age
+                                ,p.tenure
+                                ,d.prtc_stat_cd
+                                ,d.plfm_ind_cd
+                                ,d.plan_id
+                                ,d.PLAN_STAT_CD
+								,p.row_level_security_filter_value
+								,p.custom_filter_1
+								,p.custom_filter_2
+								,p.custom_filter_3
+								,p.custom_filter_4
+								,p.custom_filter_5
+                FROM prsn_planstat_dimn d
+                INNER JOIN person p ON p.client_id = d.client_id
+                                AND p.platform_person_internal_id = d.prsn_intn_id
+                WHERE d.plfm_ind_cd IN ('R3','R4','DCE')
+                                --AND UPPER(TRIM(p.employment_status)) in ('TERMINATION','ACTIVE')
+                                --AND UPPER(TRIM(prtc_stat_cd)) = 'ACTIVE'
+                )
+                ,dc_plan_dimn
+AS (
+                SELECT client_id
+                                ,plan_brand_code AS plan_brnd_cd
+                                ,plan_long_description AS plan_ldsc_tx
+                                ,plan_type_code AS plan_type_cd
+                                ,plan_id
+                FROM wealth_rpt.dc_plan_dim
+                WHERE client_id IN (<<$pClientId>>)
+                                AND plan_type_code = 'DC'
+                )
+                ,person_data
+AS (
+                SELECT a.client_id
+								,a.client_id_string
+                                ,a.platform_person_internal_id
+                                ,a.expected_annual_base_salary AS salary
+                                ,a.hourly_salary_status
+                                ,a.fulltime_parttime_status
+                                ,a.person_reason_code
+                                ,a.union_name
+                                ,a.gender
+                                ,a.employment_status
+                                ,(a.age) AS age
+                                ,(a.tenure) AS tenure
+                                ,a.prtc_stat_cd
+                                ,a.plfm_ind_cd
+                                ,a.plan_id
+                                ,a.PLAN_STAT_CD
+                                ,b.plan_brnd_cd
+                                ,b.plan_ldsc_tx
+                                ,b.plan_type_cd
+								,a.row_level_security_filter_value
+								,a.custom_filter_1
+								,a.custom_filter_2
+								,a.custom_filter_3
+								,a.custom_filter_4
+								,a.custom_filter_5
+                FROM person_planstat a
+                LEFT JOIN dc_plan_dimn b ON a.client_id = b.client_id
+                                AND a.plan_id = b.plan_id
+                WHERE b.plan_type_cd = 'DC'
+                )
+                ,range_lookup
+AS (
+                SELECT standard_group_key
+                                ,standard_display_name
+                                ,standard_min
+                                ,standard_max
+                                ,OWNER
+                FROM adlfound_itg.standard_ranges_lookup
+                )
+                ,dc_person_attributes
+AS (
+                SELECT a.client_id
+                                ,a.client_id_string
+								,a.platform_person_internal_id
+                                ,a.hourly_salary_status
+                                ,a.fulltime_parttime_status
+                                ,a.person_reason_code
+                                ,a.union_name
+                                ,a.gender
+                                ,a.employment_status
+                                ,a.prtc_stat_cd
+                                ,a.plfm_ind_cd
+                                ,a.plan_id
+                                ,a.plan_brnd_cd
+                                ,a.plan_ldsc_tx
+                                ,a.plan_type_cd
+                                ,a.age
+                                ,a.PLAN_STAT_CD
+								,a.row_level_security_filter_value
+								,a.custom_filter_1
+								,a.custom_filter_2
+								,a.custom_filter_3
+								,a.custom_filter_4
+								,a.custom_filter_5
+                                ,B.standard_display_name
+                                ,B.standard_display_name AS AGE_RANGE
+                                ,a.TENURE
+                                ,C.standard_display_name AS TENURE_RANGE
+                                ,a.salary
+                                ,D.standard_display_name AS SALARY_RANGE
+                FROM person_data a
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'AGE_RANGE_DC'
+                                ) b ON floor(a.age) BETWEEN (b.standard_min)
+                                                AND(b.standard_max)
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'TENURE'
+                                ) C ON floor(a.tenure) BETWEEN (C.standard_min)
+                                                AND(C.standard_max)
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+                                ) D ON floor (a.salary) BETWEEN (D.standard_min)
+                                                AND (D.standard_max)
+                )
+                ,join_person_balance
+AS (
+                SELECT DISTINCT p.client_id
+                                ,p.client_id_string
+								,p.platform_person_internal_id
+                                ,p.salary
+                                ,p.SALARY_RANGE
+                                ,p.hourly_salary_status
+                                ,p.prtc_stat_cd
+                                ,employment_status
+                                ,p.fulltime_parttime_status
+                                ,p.union_name
+                                ,p.gender
+                                ,p.age
+                                ,p.AGE_RANGE
+                                ,p.tenure
+                                ,p.TENURE_RANGE
+                                ,p.plan_id
+                                ,p.plan_ldsc_tx
+                                ,p.plan_type_cd
+                                ,p.PLAN_STAT_CD
+								,p.row_level_security_filter_value
+								,p.custom_filter_1
+								,p.custom_filter_2
+								,p.custom_filter_3
+								,p.custom_filter_4
+								,p.custom_filter_5
+                                ,CASE 
+                                                WHEN (
+                                                                                p.PLAN_STAT_CD IN (
+                                                                                                'ACTIVE'
+                                                                                                ,'ELIG'
+                                                                                                )
+                                                                                )
+                                                                THEN 1
+                                                ELSE 0
+                                                END AS ppt_elig_active
+                                ,last_day(last_day(<<$pAsOfDate>>)) AS reporting_month
+                FROM dc_person_attributes p
+                )
+,ccr_acct_ids as 
+    (
+	SELECT  
+    ccr_inst.client_id AS client_id,
+    trim(ccr_inst.provision_key_value) AS account_id
+    FROM adlfound_itg.ccr_instance ccr_inst
+    INNER JOIN adlfound_itg.ccr_instance_element elmnt ON elmnt.data_instance_id = ccr_inst.data_instance_id
+    AND elmnt.client_id = ccr_inst.client_id
+    AND elmnt.base_element_id in (105090,105080,105070,105060,105050,105040,105030,105020,105010,105000)
+    where ccr_inst.client_id in (<<$pClientId>>)
+    )
+                ,exp_hbal
+AS (
+                SELECT client_id AS client_id
+                                ,platform_person_internal_id AS platform_person_internal_id
+                                ,plan_id AS plan_id
+                                ,account_id AS account_id
+                                ,last_day(begin_date) AS reporting_month_end
+                                ,sum(employer_contribution_amount + payroll_contribution_amount + payroll_contribution_1_amount + payroll_contribution_2_amount + payroll_contribution_3_amount + payroll_contribution_4_amount + payroll_contribution_5_amount) AS employer_contribution_amount 
+                FROM wealth_rpt.dc_hard_balance
+                WHERE client_id IN (<<$pClientId>>)
+				and
+(employer_contribution_amount > 0 or
+payroll_contribution_amount  > 0 or
+payroll_contribution_1_amount  > 0 or
+payroll_contribution_2_amount  > 0 or
+payroll_contribution_3_amount  > 0 or
+payroll_contribution_4_amount  > 0 or
+payroll_contribution_5_amount  > 0 )
+                AND begin_date between '2024-12-01' and <<$pAsOfDate>>
+                AND cast(account_id AS INT) IN ( select account_id from ccr_acct_ids)
+                GROUP BY client_id
+                                ,plan_id
+                                ,platform_person_internal_id
+                                ,account_id
+                                ,begin_date
+                           
+                )
+ 
+                ,Agg_hbal
+AS (
+                SELECT client_id AS client_id
+                                ,plan_id AS plan_id
+                                ,reporting_month_end
+                                ,platform_person_internal_id AS platform_person_internal_id
+                                ,sum(employer_contribution_amount) AS employer_contribution_amount
+                FROM exp_hbal 
+                GROUP BY client_id
+                                ,plan_id
+                                ,reporting_month_end
+                                ,platform_person_internal_id
+                )
+SELECT a.client_id
+		,a.client_id_string
+		,a.plan_id
+		,a.plan_ldsc_tx
+		,a.reporting_month
+		,a.row_level_security_filter_value
+		,a.custom_filter_1
+		,a.custom_filter_2
+		,a.custom_filter_3
+		,a.custom_filter_4
+		,a.custom_filter_5
+		,a.SALARY_RANGE
+		,a.gender
+		,a.AGE_RANGE
+		,a.TENURE_RANGE
+		,sum(b.employer_contribution_amount) AS employer_contribution_amount
+		,sum(CASE 
+				WHEN b.employer_contribution_amount > 0
+								THEN 1
+				ELSE 0
+				END) AS num_participants_receiving_employer_match
+		,SUM(a.ppt_elig_active) AS total_elig_participants
+		,CAST(sum(CASE 
+                                                                WHEN b.employer_contribution_amount > 0
+                                                                                THEN 1
+                                                                ELSE 0
+                                                                END) AS DOUBLE PRECISION) / NULLIF(SUM(a.ppt_elig_active), 0) AS C_percentage
+FROM join_person_balance a
+Left JOIN Agg_hbal b ON a.client_id = b.client_id
+                AND a.plan_id = b.plan_id
+                AND (a.reporting_month) = (b.reporting_month_end)
+                AND a.platform_person_internal_id = b.platform_person_internal_id
+WHERE a.client_id = <<$pClientId>> 
+                AND reporting_month = <<$pAsOfDate>>
+GROUP BY a.client_id
+	  ,a.client_id_string
+	  ,a.plan_id
+      ,a.plan_ldsc_tx
+	  ,a.reporting_month
+	  ,a.row_level_security_filter_value
+	  ,a.custom_filter_1
+	  ,a.custom_filter_2
+	  ,a.custom_filter_3
+	  ,a.custom_filter_4
+	  ,a.custom_filter_5
+	  ,a.SALARY_RANGE
+	  ,a.gender
+	  ,a.AGE_RANGE
+	  ,a.TENURE_RANGE
+HAVING num_participants_receiving_employer_match > 0 ORDER BY 1

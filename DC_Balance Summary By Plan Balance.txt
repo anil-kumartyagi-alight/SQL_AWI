@@ -1,0 +1,171 @@
+WITH params AS (
+    SELECT CAST(<<$pAsOfDate>> AS DATE) AS as_of_date
+),
+fund_balances AS (
+    SELECT fund.client_id, fund.platform_id, fund.platform_person_internal_id, fund.plan_id, fund.fund_id, fund.closing_units,hbal_d.plan_long_description AS plan_ldsc_tx
+    FROM wealth_rpt.dc_hard_balance fund
+    INNER JOIN (select distinct hardbalance_id AS hbal_id,client_id,fund_id,plan_id,plan_long_description from wealth_rpt.hardbalance_dim where plan_type_code = 'DC' and client_id = cast(<<$pClientId>> as int) ) hbal_d 
+    ON  
+	hbal_d.client_id = fund.client_id and 
+	fund.plan_id = hbal_d.plan_id  and
+	fund.fund_id = hbal_d.fund_id and fund.hard_balance_id = hbal_d.hbal_id
+    WHERE fund.client_id = cast(<<$pClientId>> as int) 
+      AND (SELECT as_of_date FROM params) BETWEEN begin_date AND end_date
+),
+person_data AS (
+    SELECT
+        p.client_id, p.client_id_string, p.platform_id, p.platform_person_internal_id,
+        p.last_name, p.first_name, p.middle_name, p.gender, p.birth_date,
+        p.person_reason_code, p.union_name
+    FROM person_rpt.person p
+    WHERE p.client_id = cast(<<$pClientId>> as int) 
+      AND (SELECT as_of_date FROM params) BETWEEN p.begin_date AND p.end_date
+      AND EXISTS (
+          SELECT 1
+          FROM fund_balances fb
+          WHERE fb.platform_person_internal_id = p.platform_person_internal_id
+      )
+)
+,
+employment_data AS (
+    SELECT
+        p.client_id, p.platform_id, p.platform_person_internal_id,
+        p.employee_id, p.hire_date, p.termination_date, p.expected_annual_base_salary,
+        standard_value as employment_status, p.employment_status_begin_date,
+        p.fulltime_parttime_status, p.hourly_salary_status
+    FROM person_rpt.person_employment p
+	LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+	ON p.standard_employment_status_code = rl.standard_key
+	AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+    WHERE p.client_id = cast(<<$pClientId>> as int) 
+      AND (SELECT as_of_date FROM params) BETWEEN p.begin_date AND p.end_date
+      AND EXISTS (
+          SELECT 1
+          FROM fund_balances fb
+          WHERE fb.platform_person_internal_id = p.platform_person_internal_id
+      )
+)
+,
+security_filters AS (
+    SELECT platform_id, platform_person_internal_id, row_level_security_filter_value
+    FROM person_itg.person_security_filter
+    WHERE client_id = cast(<<$pClientId>> as int) 
+)
+,
+custom_filters AS (
+    SELECT platform_id, platform_person_internal_id,
+        custom_filter_1, custom_filter_2, custom_filter_3, custom_filter_4, custom_filter_5
+    FROM person_itg.person_custom_filter
+    WHERE client_id = cast(<<$pClientId>> as int) 
+      AND data_product = 'DC'
+      AND (SELECT as_of_date FROM params) BETWEEN begin_date AND end_date
+)
+,
+plan_status AS (
+    SELECT 
+        a.client_id, a.platform_person_internal_id AS prsn_intn_id, a.category_id AS cat_id,
+        a.begin_date AS pp_stat_efbeg_dt, a.end_date AS pp_stat_efend_dt,
+        a.plan_status_description AS plan_stat_tx, a.plan_id
+    FROM wealth_rpt.person_planstatus_dim a
+    JOIN wealth_rpt.dc_category_dim b
+        ON a.client_id = b.client_id
+        AND a.category_id = b.category_id
+        AND a.plan_id = b.plan_id
+    WHERE a.platform_indicator_code IN ('R3', 'R4', 'DCE')
+      AND b.category_type_code = 'PS'
+      AND b.category_definition_brand_code = 'PRTC-STAT'
+      AND (SELECT as_of_date FROM params) BETWEEN a.begin_date AND a.end_date
+      AND a.client_id = cast(<<$pClientId>> as int) 
+      AND b.client_id = cast(<<$pClientId>> as int) 
+)
+,
+fund_prices AS (
+    SELECT client_id, fund_id, daily_price
+    FROM wealth_rpt.buysell_fund_prices
+    WHERE client_id = cast(<<$pClientId>> as int) 
+      AND effective_date = (SELECT as_of_date FROM params)
+),
+Main_Query AS (
+    SELECT
+        p.client_id AS Client_ID,
+        p.client_id_string,
+        p.platform_person_internal_id AS Person_Internal_ID,
+        e.employee_id AS Employee_ID,
+        p.last_name AS Last_Name,
+        p.first_name AS First_Name,
+        p.middle_name AS Middle_Name,
+        p.gender AS Gender,
+        p.birth_date AS Birth_Date,
+        e.hire_date AS Hire_Date,
+        FLOOR(e.expected_annual_base_salary) AS Salary,
+        FLOOR(DATEDIFF(DAY, p.birth_date, (SELECT as_of_date FROM params)) / 365.25) AS Age,
+        CASE 
+            WHEN p.person_reason_code = 'Employee' AND UPPER(e.employment_status) = 'ACTIVE'
+                THEN FLOOR(DATEDIFF(DAY, e.hire_date, (SELECT as_of_date FROM params)) / 365.25)
+            WHEN p.person_reason_code = 'Employee' AND UPPER(e.employment_status) <> 'ACTIVE'
+                AND e.termination_date IS NOT NULL
+                AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+                THEN FLOOR(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25)
+            ELSE NULL
+        END AS Tenure,
+        p.person_reason_code AS Person_Type,
+        e.employment_status AS Employment_Status,
+        e.employment_status_begin_date AS Employment_Status_Begin_Date,
+        e.fulltime_parttime_status AS FullTime_PartTime,
+        e.hourly_salary_status AS Salary_Hourly,
+        p.union_name AS Union,
+        f.plan_ldsc_tx AS Plan_Name,
+        ps.plan_stat_tx AS Plan_Status,
+        ROUND(SUM(f.closing_units * fp.daily_price), 2) AS Total_Plan_Balance,
+        sf.row_level_security_filter_value,
+        cf.custom_filter_1, cf.custom_filter_2, cf.custom_filter_3, cf.custom_filter_4, cf.custom_filter_5
+    FROM person_data p
+    JOIN employment_data e ON
+        p.client_id = e.client_id AND
+        p.platform_id = e.platform_id AND
+        p.platform_person_internal_id = e.platform_person_internal_id
+    LEFT JOIN security_filters sf ON
+        p.platform_id = sf.platform_id AND
+        p.platform_person_internal_id = sf.platform_person_internal_id
+    LEFT JOIN custom_filters cf ON
+        p.platform_id = cf.platform_id AND
+        p.platform_person_internal_id = cf.platform_person_internal_id
+    JOIN fund_balances f ON
+        p.client_id = f.client_id AND
+        p.platform_id = f.platform_id AND
+        p.platform_person_internal_id = f.platform_person_internal_id
+    LEFT JOIN plan_status ps ON
+        ps.client_id = f.client_id AND
+        ps.plan_id = f.plan_id AND
+        ps.prsn_intn_id = f.platform_person_internal_id AND
+        (SELECT as_of_date FROM params) BETWEEN ps.pp_stat_efbeg_dt AND ps.pp_stat_efend_dt
+    JOIN fund_prices fp ON
+        f.client_id = fp.client_id AND
+        f.fund_id = fp.fund_id
+    GROUP BY
+        p.client_id, p.client_id_string, p.platform_person_internal_id,
+        e.employee_id, p.last_name, p.first_name, p.middle_name,
+        p.gender, p.birth_date, e.hire_date, e.termination_date,
+        e.expected_annual_base_salary, p.person_reason_code,
+        p.union_name, e.employment_status, e.employment_status_begin_date,
+        e.fulltime_parttime_status, e.hourly_salary_status,
+        f.plan_ldsc_tx, ps.plan_stat_tx,
+        sf.row_level_security_filter_value,
+        cf.custom_filter_1, cf.custom_filter_2, cf.custom_filter_3, cf.custom_filter_4, cf.custom_filter_5
+)
+SELECT 
+    mq.*,
+    age.standard_display_name AS Age_Range,
+    sal.standard_display_name AS Salary_Range,
+    ten.standard_display_name AS Employment_Range
+FROM Main_Query mq
+LEFT JOIN adlfound_itg.standard_ranges_lookup age
+    ON FLOOR(mq.Age) BETWEEN age.standard_min AND age.standard_max
+    AND age.standard_group_key = 'AGE_RANGE_DC'
+LEFT JOIN adlfound_itg.standard_ranges_lookup ten
+    ON FLOOR(mq.Tenure) BETWEEN ten.standard_min AND ten.standard_max
+    AND ten.standard_group_key = 'TENURE'
+LEFT JOIN adlfound_itg.standard_ranges_lookup sal
+    ON FLOOR(mq.Salary) BETWEEN sal.standard_min AND sal.standard_max
+    AND sal.standard_group_key = 'SALARY_RANGE_WEALTH'
+WHERE mq.Plan_Name IS NOT NULL

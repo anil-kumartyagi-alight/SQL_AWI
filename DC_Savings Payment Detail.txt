@@ -1,0 +1,353 @@
+WITH dc_distributions_data AS (
+    SELECT
+        client_id,
+        platform_id,
+        platform_person_internal_id,
+        plan_id,
+        payment_result_effective_date,
+        gross_distribution_amount,
+        total_rollover_amount,
+        rollover_ira_amount,
+        rollover_qualified_plan_amount,
+        non_rollover_amount,
+        actual_federal_withdrawal_amount,
+        actual_state_withdrawal_amount,
+        tax_state_code,
+        loan_settlement_amount,
+        roth_total_amount,
+        participant_share_cost_amount,
+        final_unrealized_appr_amount,
+        roth_non_taxable_contribution_amount,
+        months_between_term_and_distribution,
+        roth_begin_date,
+        is_roth_qualifying,
+        is_direct_deposit,
+        hardship_reason_1,
+        hardship_reason_2,
+        hardship_reason_3,
+        activity_reference_number_id
+    FROM wealth_rpt.vw_dc_distributions
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND payment_result_effective_date BETWEEN <<$pBeginDate>> AND <<$pEndDate>>
+),
+person_data AS (
+    SELECT
+        client_id,
+        client_id_string,
+        platform_id,
+        platform_person_internal_id,
+        last_name,
+        first_name,
+        middle_name,
+        gender,
+        birth_date,
+        union_name,
+        person_reason_code,
+        begin_date,
+        end_date
+    FROM person_rpt.person p
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND <<$pEndDate>> BETWEEN begin_date AND end_date
+      AND EXISTS (
+          SELECT 1
+          FROM dc_distributions_data dd
+          WHERE dd.platform_person_internal_id = p.platform_person_internal_id
+      )
+),
+employment_data AS (
+    SELECT
+        client_id,
+        platform_id,
+        platform_person_internal_id,
+        employee_id,
+        standard_value AS employment_status,
+        hire_date,
+        termination_date,
+        expected_annual_base_salary,
+        fulltime_parttime_status,
+        hourly_salary_status,
+        employment_status_begin_date
+    FROM person_rpt.person_employment p
+	LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+	ON p.standard_employment_status_code = rl.standard_key
+	AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND <<$pEndDate>> BETWEEN begin_date AND end_date
+      AND EXISTS (
+          SELECT 1
+          FROM dc_distributions_data dd
+          WHERE dd.platform_person_internal_id = p.platform_person_internal_id
+      )
+),
+security_filter AS (
+    SELECT
+        client_id,
+        platform_id,
+        platform_person_internal_id,
+        row_level_security_filter_value
+    FROM person_itg.person_security_filter psf
+    WHERE client_id = cast(<<$pClientId>> as int)
+        AND EXISTS (
+            SELECT 1
+            FROM dc_distributions_data dd
+            WHERE dd.platform_person_internal_id = psf.platform_person_internal_id
+        )
+),
+custom_filter AS (
+    SELECT
+        client_id,
+        platform_id,
+        platform_person_internal_id,
+        begin_date,
+        end_date,
+        data_product,
+        custom_filter_1,
+        custom_filter_2,
+        custom_filter_3,
+        custom_filter_4,
+        custom_filter_5
+    FROM person_itg.person_custom_filter pcf
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND <<$pEndDate>> BETWEEN begin_date AND end_date
+      AND data_product = 'DC'
+        AND EXISTS (
+            SELECT 1
+            FROM dc_distributions_data dd
+            WHERE dd.platform_person_internal_id = pcf.platform_person_internal_id
+        )
+),
+plan_data AS (
+    SELECT
+        plan_id,
+        client_id,
+        platform_id,
+        plan_type_code,
+        plan_long_description
+    FROM wealth_rpt.dc_plan_dim
+    WHERE plan_type_code = 'DC'
+      AND client_id = cast(<<$pClientId>> as int)
+),
+plan_status_data AS (
+    SELECT
+        a.client_id,
+        a.platform_person_internal_id AS prsn_intn_id,
+        a.category_id AS cat_id,
+        a.begin_date AS pp_stat_efbeg_dt,
+        a.end_date AS pp_stat_efend_dt,
+        a.plan_status_code AS plan_stat_cd,
+        a.participation_status_code AS prtc_stat_cd,
+        a.platform_indicator_code AS plfm_ind_cd,
+        a.plan_id,
+        b.category_type_code AS cat_type_cd,
+        a.plan_status_description AS plan_stat_tx
+    FROM wealth_rpt.person_planstatus_dim a
+    INNER JOIN wealth_rpt.dc_category_dim b
+        ON a.client_id = b.client_id AND a.category_id = b.category_id AND a.plan_id = b.plan_id
+    WHERE a.platform_indicator_code IN ('R3', 'R4', 'DCE')
+      AND b.category_type_code = 'PS'
+      AND <<$pEndDate>> BETWEEN a.begin_date AND a.end_date
+      AND b.category_definition_brand_code = 'PRTC-STAT'
+      AND a.client_id = cast(<<$pClientId>> as int)
+      AND b.client_id = cast(<<$pClientId>> as int)
+),
+
+ranked_activity AS (
+    SELECT
+        pa.client_id,
+        pa.platform_id,
+        pa.platform_person_internal_id,
+        pa.activity_reference_id,         
+        pa.activity_name,
+		pa.activity_effective_date,
+        pa.domain,
+        pa.activity_change_cst_ts,
+        ROW_NUMBER() OVER (
+            PARTITION BY pa.client_id,
+                         pa.platform_id,
+                         pa.platform_person_internal_id,
+                         pa.activity_reference_id
+            ORDER BY pa.activity_change_cst_ts DESC
+        ) AS rnk
+    FROM alightops_rpt.person_activity pa
+    WHERE pa.client_id = CAST(<<$pClientId>> AS INT)
+),
+
+activity_data AS (
+    SELECT
+        ra.client_id,
+        ra.platform_id,
+        ra.platform_person_internal_id,
+        ra.activity_reference_id,
+        ra.activity_name,
+        ra.domain,
+        ra.activity_change_cst_ts
+    FROM ranked_activity ra
+    WHERE ra.rnk = 1
+	  AND ra.activity_effective_date BETWEEN <<$pBeginDate>> AND <<$pEndDate>>
+      AND ra.domain = 'DC'
+      AND EXISTS (
+            SELECT 1
+            FROM dc_distributions_data dd
+            WHERE dd.platform_person_internal_id = ra.platform_person_internal_id
+              AND dd.activity_reference_number_id = ra.activity_reference_id
+			  AND dd.client_id = ra.client_id
+			  AND dd.platform_id = ra.platform_id
+			  
+        )
+),
+
+/*activity_data AS (
+    SELECT * 
+	FROM (
+		SELECT
+			client_id,
+			platform_id,
+			platform_person_internal_id,
+			activity_reference_id,
+			activity_name,
+			domain,
+			pa.activity_change_cst_ts,
+			ROW_NUMBER() OVER (
+				PARTITION BY pa.client_id,
+							 pa.platform_id,
+							 pa.platform_person_internal_id,
+							 pa.activity_reference_id
+				ORDER BY pa.activity_change_cst_ts DESC
+			) AS rnk
+		FROM alightops_rpt.person_activity pa
+		WHERE client_id = cast(<<$pClientId>> as int)
+		AND activity_effective_date >= <<$pBeginDate>>
+		AND activity_effective_date <= <<$pEndDate>>
+		  AND domain = 'DC'
+			AND EXISTS (
+				SELECT 1
+				FROM dc_distributions_data dd
+				WHERE dd.platform_person_internal_id = pa.platform_person_internal_id
+				AND dd.activity_reference_number_id = pa.activity_reference_id
+				)) table1
+	WHERE rnk = 1
+			
+),*/
+
+main_query AS (
+    SELECT
+        person.client_id AS Client_ID,
+        person.client_id_string,
+        person.platform_person_internal_id AS Person_Internal_ID,
+        employee.employee_id AS Employee_ID,
+        person.last_name AS Last_Name,
+        person.first_name AS First_Name,
+        person.middle_name AS Middle_Name,
+        person.gender AS Gender,
+        FLOOR(DATEDIFF(day, person.birth_date, <<$pEndDate>>) / 365.25) AS Age,
+        CASE
+            WHEN person.person_reason_code = 'Employee' AND UPPER(employee.employment_status) = 'ACTIVE'
+                THEN FLOOR(DATEDIFF(DAY, employee.hire_date, <<$pEndDate>>) / 365.25)
+            WHEN person.person_reason_code = 'Employee' AND UPPER(employee.employment_status) <> 'ACTIVE'
+                 AND employee.termination_date IS NOT NULL AND EXTRACT(YEAR FROM employee.termination_date) <> 2299
+                THEN FLOOR(DATEDIFF(DAY, employee.hire_date, employee.termination_date) / 365.25)
+            ELSE NULL
+        END AS Length_Of_Employment,
+        FLOOR(employee.expected_annual_base_salary) AS Salary,
+        employee.fulltime_parttime_status AS FullTime_PartTime,
+        employee.hourly_salary_status AS Salary_Hourly,
+        person.union_name AS Union,
+        person.person_reason_code AS Person_Type,
+        employee.employment_status AS Employment_Status,
+        employee.employment_status_begin_date AS Employment_Status_Begin_Date,
+        dc_plan_dimn.plan_long_description AS Plan_Name,
+        ppstat.plan_stat_tx AS Plan_Status,
+        dc_distributions.payment_result_effective_date AS Payment_Effective_Date,
+        prsn_act.activity_name AS Payment_Type,
+        dc_distributions.gross_distribution_amount AS Gross_Distribution_Amount,
+        dc_distributions.total_rollover_amount AS Total_Rollover_Amount,
+        dc_distributions.rollover_ira_amount AS Rollover_Amount_IRA,
+        dc_distributions.rollover_qualified_plan_amount AS Rollover_Amount_Qualified_Plan,
+        dc_distributions.non_rollover_amount AS Amount_Not_Rolled_Over,
+        dc_distributions.actual_federal_withdrawal_amount AS Federal_Withholding,
+        dc_distributions.actual_state_withdrawal_amount AS State_Withholding,
+        dc_distributions.tax_state_code AS Withholding_State,
+        dc_distributions.loan_settlement_amount AS Loan_Settlement,
+        dc_distributions.roth_total_amount AS Total_Roth_401K_Amount,
+        dc_distributions.participant_share_cost_amount AS Share_Cost_Basis,
+        dc_distributions.final_unrealized_appr_amount AS Unrealized_Appreciation,
+        dc_distributions.roth_non_taxable_contribution_amount AS Roth_401k_Non_taxable_Contributions,
+        dc_distributions.months_between_term_and_distribution AS Lapsed_Time_Between_Termination_and_Distribution_Months,
+        dc_distributions.roth_begin_date AS Roth_Begin_Date_for_Payment,
+        CASE
+            WHEN DATE(dc_distributions.roth_begin_date) IN (CAST('1800-01-01' AS DATE), CAST('2299-12-31' AS DATE))
+                THEN NULL
+            ELSE DATEDIFF(YEAR, dc_distributions.payment_result_effective_date, DATE(dc_distributions.roth_begin_date))
+        END AS Age_of_Roth_Account,
+        dc_distributions.is_roth_qualifying AS Roth_Qualified_Payment_Indicator,
+        dc_distributions.is_direct_deposit AS Direct_Deposit_Indicator,
+        dc_distributions.hardship_reason_1 AS Hardship_Reason_1_Description,
+        dc_distributions.hardship_reason_2 AS Hardship_Reason_2_Description,
+        dc_distributions.hardship_reason_3 AS Hardship_Reason_3_Description,
+        psf.row_level_security_filter_value,
+        pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5
+    FROM person_data person
+    LEFT JOIN employment_data employee ON
+        person.client_id = employee.client_id AND
+        person.platform_id = employee.platform_id AND
+        person.platform_person_internal_id = employee.platform_person_internal_id
+    LEFT JOIN security_filter psf ON
+        person.platform_id = psf.platform_id AND
+        person.platform_person_internal_id = psf.platform_person_internal_id AND
+        person.client_id = psf.client_id
+    LEFT JOIN custom_filter pcf ON
+        person.platform_id = pcf.platform_id AND
+        person.platform_person_internal_id = pcf.platform_person_internal_id AND
+        person.client_id = pcf.client_id
+    INNER JOIN dc_distributions_data dc_distributions ON
+        person.client_id = dc_distributions.client_id AND
+        person.platform_id = dc_distributions.platform_id AND
+        person.platform_person_internal_id = dc_distributions.platform_person_internal_id
+    INNER JOIN plan_data dc_plan_dimn ON
+        dc_plan_dimn.plan_id = dc_distributions.plan_id AND
+        dc_plan_dimn.client_id = dc_distributions.client_id AND
+        dc_plan_dimn.platform_id = dc_distributions.platform_id
+    INNER JOIN plan_status_data ppstat ON
+        ppstat.client_id = dc_distributions.client_id AND
+        ppstat.plan_id = dc_distributions.plan_id AND
+        ppstat.prsn_intn_id = dc_distributions.platform_person_internal_id AND
+        <<$pEndDate>> BETWEEN ppstat.pp_stat_efbeg_dt AND ppstat.pp_stat_efend_dt
+    INNER JOIN activity_data prsn_act ON
+        prsn_act.client_id = dc_distributions.client_id AND
+        prsn_act.platform_id = dc_distributions.platform_id AND
+        prsn_act.platform_person_internal_id = dc_distributions.platform_person_internal_id AND
+        prsn_act.activity_reference_id = dc_distributions.activity_reference_number_id
+),
+age_range AS (
+    SELECT
+        standard_min,
+        standard_max,
+        standard_display_name
+    FROM adlfound_itg.standard_ranges_lookup
+    WHERE standard_group_key = 'AGE_RANGE_DC'
+),
+tenure_range AS (
+    SELECT
+        standard_min,
+        standard_max,
+        standard_display_name
+    FROM adlfound_itg.standard_ranges_lookup
+    WHERE standard_group_key = 'TENURE'
+),
+salary_range AS (
+    SELECT
+        standard_min,
+        standard_max,
+        standard_display_name
+    FROM adlfound_itg.standard_ranges_lookup
+    WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+)
+    SELECT 
+        mq.*, 
+        ar.standard_display_name AS Age_Range,
+        sr.standard_display_name AS Salary_Range,
+        tr.standard_display_name AS Employment_Range
+    FROM main_query mq
+    LEFT JOIN age_range ar ON FLOOR(mq.Age) BETWEEN ar.standard_min AND ar.standard_max
+    LEFT JOIN tenure_range tr ON FLOOR(mq.Length_Of_Employment) BETWEEN tr.standard_min AND tr.standard_max
+    LEFT JOIN salary_range sr ON FLOOR(mq.Salary) BETWEEN sr.standard_min AND sr.standard_max

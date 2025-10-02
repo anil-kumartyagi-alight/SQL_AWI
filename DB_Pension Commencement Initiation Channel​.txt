@@ -1,0 +1,91 @@
+WITH mv_person_employment
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,platform_id
+		,platform_person_internal_id
+		,expected_annual_base_salary
+		,hourly_salary_status
+		,fulltime_parttime_status
+		,employment_status
+		,hire_date
+		--,termination_date
+		,CASE WHEN  EXTRACT(YEAR FROM termination_date) < 1900 THEN NULL ELSE termination_date end as termination_date
+		,employee_id
+		,employment_status_begin_date
+	FROM person_rpt.person_employment
+	WHERE 
+    begin_date <=  LAST_DAY(ADD_MONTHS(CURRENT_DATE, -1))
+		AND end_date >=  LAST_DAY(ADD_MONTHS(CURRENT_DATE, -1))
+		 AND client_id =   cast(<<$pClientId>> as int)
+	)
+	,
+	Exp_db_cmnct_fact_detail AS (
+    SELECT DISTINCT
+        platform_id AS platform_id,
+        client_id AS client_id, client_id_string, row_level_security_filter_value, 
+        platform_person_internal_id AS person_internal_id,
+		date( activity_initiated_cst_ts)AS Pension_Commencement_Event_Start_Date,
+		date( intent_retire_activity_completed_cst_ts) AS Pension_Commencement_Complete_Cancel_Expire_Date,
+	    trim(commencement_status) AS event_status,
+		benefit_commencement_date,
+		start_channel as Pesion_commencement_event_start_channel,
+	--	result_channel as Pension_Commencement_Complete_Cancel_Expire_Channel,
+	CASE 
+
+             WHEN trim(result_channel) in ('A','Admin') THEN 'Admin'
+
+            WHEN trim(result_channel) in ('B','Batch') THEN 'Batch'
+
+            WHEN trim(result_channel) in ('D','Form') THEN 'Form'
+
+            WHEN trim(result_channel) in ('T','Telephone Representative','Telephone Rep.') THEN 'Telephone Representative'
+
+            WHEN trim(result_channel) in ('U','UPoint') THEN 'UPoint'
+
+            WHEN trim(result_channel) in ('W','Web') THEN 'Web'
+
+        END AS Pension_Commencement_Complete_Cancel_Expire_Channel,
+
+		commencement_result_elapsed_days as Pension_Commencement_Complete_Cancel_Expire_Elapsed_Time__Days
+				FROM wealth_rpt.db_commencement db_commencement_detail
+    WHERE  client_id =   cast(<<$pClientId>> as int) AND 
+	date(db_commencement_detail.activity_initiated_cst_ts) >= '1800-01-01'
+and DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', date( db_commencement_detail.activity_initiated_cst_ts))))
+between date(DATE_TRUNC('month',ADD_MONTHS(CURRENT_DATE, -13))) and date(LAST_DAY(ADD_MONTHS(CURRENT_DATE, -1))) 
+
+)
+,
+
+Exp_cmnct_of_benefit_init_comm AS (
+SELECT DISTINCT 
+person_attributes.client_id as Client_ID, Exp_db_cmnct_fact_detail.client_id_string, Exp_db_cmnct_fact_detail.row_level_security_filter_value, 
+-- ltrim(to_char(person_attributes.client_id,'99999')) as client_id_string, 
+person_attributes.platform_person_internal_id as Person_Internal_ID,
+person_attributes.employee_id  as Employee_ID ,
+person_attributes.employment_status  as Employment_Status ,
+	
+Exp_db_cmnct_fact_detail.Benefit_Commencement_Date,
+case when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('W','U','WEB','UPOINT') then 'Web'
+when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('T','D','TELEPHONE REPRESENTATIVE','FORM','TELEPHONE REP.') then 'Call center'
+when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('B','BATCH') then 'System Initiated'
+end as Pesion_commencement_event_start_channel,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Event_Start_Date,
+--'Initiated Commencement' AS Pension_commencement_status,
+'Initiated' AS Pension_commencement_status,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Complete_Cancel_Expire_Channel,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Complete_Cancel_Expire_Date,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Complete_Cancel_Expire_Elapsed_Time__Days
+FROM Exp_db_cmnct_fact_detail  inner join mv_person_employment person_attributes on Exp_db_cmnct_fact_detail.person_internal_id=person_attributes.platform_person_internal_id
+and Exp_db_cmnct_fact_detail.client_id=person_attributes.client_id 
+and Exp_db_cmnct_fact_detail.platform_id=person_attributes.platform_id 
+where
+DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', Pension_Commencement_Event_Start_Date)))
+between  DATE_TRUNC('month',ADD_MONTHS(CURRENT_DATE, -13)) and LAST_DAY(ADD_MONTHS(CURRENT_DATE, -1)) 
+)
+select client_id, client_id_string, row_level_security_filter_value,  DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', Pension_Commencement_Event_Start_Date))) as Reporting_Month_Date, 
+pesion_commencement_event_start_channel as start_channel_description
+,count(person_internal_id) as Count1
+ from Exp_cmnct_of_benefit_init_comm group by client_id, client_id_string, row_level_security_filter_value,  DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', Pension_Commencement_Event_Start_Date))), 
+pesion_commencement_event_start_channel

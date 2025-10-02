@@ -1,0 +1,226 @@
+-- custom calculated fields logic:
+-- $ value of account = sum(participant_bal_in_fund)
+-- % value of account = sum(row participant_bal_in_fund)/sum(total rows of participant_bal_in_fund)
+-- # participants = count(platform_person_internal_id)
+-- % ppts = count(row platform_person_internal_id) / count(total rows distinct platform_person_internal_id)
+
+WITH as_of_date AS (
+    SELECT LAST_DAY(<<$pAsOfDate>>) AS as_of_dt
+),
+dc_hard_ids AS (
+    SELECT DISTINCT platform_person_internal_id
+    FROM wealth_rpt.dc_hard_balance
+    WHERE client_id = cast(<<$pClientId>> as int)
+      AND closing_units > 0
+      AND end_date >= (SELECT as_of_dt FROM as_of_date)
+      AND begin_date <= (SELECT as_of_dt FROM as_of_date)
+),
+dc_hard_balance AS (
+    SELECT
+        fb.global_client_id,
+        fb.global_person_id,
+        fb.platform_id,
+        fb.client_id,
+        fb.platform_person_internal_id,
+        fb.plan_id,
+        fb.fund_id,
+        hdm.fund_long_description,
+        SUM(fb.closing_units) AS closing_units,
+        COALESCE(SUM(fb.closing_units) * b.daily_price, 0) AS plan_balance
+    FROM wealth_rpt.dc_hard_balance fb
+    INNER JOIN wealth_rpt.hardbalance_dim hdm 
+        ON fb.client_id = hdm.client_id 
+        AND fb.plan_id = hdm.plan_id 
+        AND fb.fund_id = hdm.fund_id 
+        AND fb.hard_balance_id = hdm.hardbalance_id
+    LEFT JOIN wealth_rpt.buysell_fund_prices b 
+        ON fb.client_id = b.client_id 
+        AND fb.platform_id = b.platform_id 
+        AND fb.fund_id = b.fund_id 
+        AND b.effective_date = (SELECT as_of_dt FROM as_of_date)
+    WHERE 
+        fb.closing_units > 0
+        AND fb.client_id = cast(<<$pClientId>> as int)
+        AND fb.end_date >= (SELECT as_of_dt FROM as_of_date)
+        AND fb.begin_date <= (SELECT as_of_dt FROM as_of_date)
+        AND hdm.plan_type_code = 'DC'
+    GROUP BY 
+        fb.global_client_id,
+        fb.global_person_id,
+        fb.platform_id,
+        fb.client_id,
+        fb.platform_person_internal_id,
+        fb.plan_id,
+        fb.fund_id,
+        hdm.fund_long_description,
+        b.daily_price
+),
+mv_person AS (
+    SELECT 
+        p.global_client_id,
+        p.global_person_id,
+        p.platform_id,
+        p.client_id,
+        p.client_id_string,
+        p.platform_person_internal_id,
+        p.gender,
+        p.birth_date,
+        p.person_reason_code,
+        p.union_name,
+        p.begin_date,
+        p.end_date
+    FROM person_rpt.person p
+    WHERE 
+        p.end_date >= (SELECT as_of_dt FROM as_of_date)
+        AND p.begin_date <= (SELECT as_of_dt FROM as_of_date)
+        AND p.client_id = cast(<<$pClientId>> as int)
+        AND EXISTS (
+            SELECT 1
+            FROM dc_hard_ids hb 
+            WHERE hb.platform_person_internal_id = p.platform_person_internal_id
+        )
+),
+mv_person_employment AS (
+    SELECT 
+        e.global_client_id,
+        e.global_person_id,
+        e.platform_id,
+        e.client_id,
+        e.platform_person_internal_id,
+        e.expected_annual_base_salary,
+        e.hourly_salary_status,
+        e.fulltime_parttime_status,
+		e.standard_employment_status,
+        COALESCE(rl.standard_value, e.employment_status) AS employment_status,
+        e.hire_date,
+        e.termination_date
+    FROM person_rpt.person_employment e
+    LEFT JOIN adlfound_itg.standard_rollups_lookup rl
+        ON e.standard_employment_status_code = rl.standard_key
+        AND rl.standard_group_key = 'EMPL-STAT-CD-ROLLUP1'
+    JOIN dc_hard_ids hb 
+        ON e.platform_person_internal_id = hb.platform_person_internal_id
+    WHERE 
+        e.begin_date <= (SELECT as_of_dt FROM as_of_date)
+        AND e.end_date >= (SELECT as_of_dt FROM as_of_date)
+        AND e.client_id = cast(<<$pClientId>> as int)
+        AND EXISTS (
+            SELECT 1
+            FROM dc_hard_ids hb 
+            WHERE hb.platform_person_internal_id = e.platform_person_internal_id
+        )
+),
+person AS (
+    SELECT 
+        p.platform_id,
+        p.client_id,
+        p.client_id_string,
+        p.platform_person_internal_id,
+        psf.row_level_security_filter_value,
+        pcf.custom_filter_1, 
+        pcf.custom_filter_2, 
+        pcf.custom_filter_3, 
+        pcf.custom_filter_4, 
+        pcf.custom_filter_5,
+        FLOOR(e.expected_annual_base_salary) AS expected_annual_base_salary,
+        e.hourly_salary_status,
+        e.fulltime_parttime_status,
+        e.standard_employment_status,
+        p.gender,
+        p.union_name,
+        Floor(CASE 
+            WHEN p.birth_date IN ('1800-01-01','1900-01-01','1901-01-01','1910-01-01','1930-01-01')
+                THEN NULL 
+            ELSE FLOOR(DATEDIFF(day, p.birth_date, (SELECT as_of_dt FROM as_of_date)) / 365.25) 
+        END) AS age,
+        CASE 
+            WHEN p.person_reason_code = 'Employee' AND UPPER(e.employment_status) = 'ACTIVE'
+                THEN FLOOR(DATEDIFF(day, e.hire_date, (SELECT as_of_dt FROM as_of_date)) / 365.25)
+            WHEN p.person_reason_code = 'Employee' AND UPPER(e.employment_status) <> 'ACTIVE'
+                AND e.termination_date IS NOT NULL
+                AND EXTRACT(year FROM e.termination_date) <> 2299
+                THEN FLOOR(DATEDIFF(day, e.hire_date, e.termination_date) / 365.25)
+            ELSE NULL 
+        END AS tenure
+    FROM mv_person p
+    INNER JOIN mv_person_employment e 
+        ON p.client_id = e.client_id 
+        AND p.platform_id = e.platform_id 
+        AND p.platform_person_internal_id = e.platform_person_internal_id
+    LEFT JOIN person_itg.person_security_filter psf
+        ON p.platform_id = psf.platform_id
+        AND p.platform_person_internal_id = psf.platform_person_internal_id
+        AND p.client_id = psf.client_id
+    LEFT JOIN person_itg.person_custom_filter pcf
+        ON p.platform_id = pcf.platform_id
+        AND p.platform_person_internal_id = pcf.platform_person_internal_id
+        AND p.client_id = pcf.client_id
+        AND pcf.data_product = 'DC'
+        AND pcf.begin_date <= (SELECT as_of_dt FROM as_of_date)
+        AND pcf.end_date >= (SELECT as_of_dt FROM as_of_date)
+),
+dc_plan_dimn AS (
+    SELECT 
+        platform_id,
+        client_id,
+        plan_id,
+        plan_long_description AS plan_name
+    FROM wealth_rpt.dc_plan_dim
+    WHERE client_id = cast(<<$pClientId>> as int) AND plan_type_code = 'DC'
+),
+range_lookup AS (
+    SELECT 
+        standard_group_key,
+        standard_display_name,
+        standard_min,
+        standard_max
+    FROM adlfound_itg.standard_ranges_lookup
+),
+dc_person_attributes AS (
+    SELECT 
+        a.*,
+        b.standard_display_name AS age_range,
+        c.standard_display_name AS tenure_range,
+        d.standard_display_name AS salary_range
+    FROM person a
+    LEFT JOIN range_lookup b 
+        ON b.standard_group_key = 'AGE_RANGE_DC' 
+        AND floor(a.age) BETWEEN b.standard_min AND b.standard_max 
+    LEFT JOIN range_lookup c 
+        ON c.standard_group_key = 'TENURE' 
+        AND floor(a.tenure) BETWEEN c.standard_min AND c.standard_max 
+    LEFT JOIN range_lookup d 
+        ON d.standard_group_key = 'SALARY_RANGE_WEALTH' 
+        AND floor(a.expected_annual_base_salary) BETWEEN d.standard_min AND d.standard_max 
+)
+SELECT  
+    p.client_id,
+    p.client_id_string,
+    p.row_level_security_filter_value,
+    p.custom_filter_1,
+    p.custom_filter_2,
+    p.custom_filter_3,
+    p.custom_filter_4,
+    p.custom_filter_5,
+    pb.fund_long_description,
+    pb.fund_id,
+    b.plan_name,
+    p.gender,   
+    p.age_range,
+    p.salary_range,
+    p.tenure_range,
+    p.standard_employment_status as employment_status,
+    p.hourly_salary_status,
+    p.fulltime_parttime_status,
+    p.union_name,
+    pb.plan_balance AS participant_bal_in_fund,
+    pb.platform_person_internal_id
+FROM dc_hard_balance pb
+INNER JOIN dc_person_attributes p
+    ON pb.client_id = p.client_id 
+    AND pb.platform_id = p.platform_id 
+    AND pb.platform_person_internal_id = p.platform_person_internal_id 
+INNER JOIN dc_plan_dimn b 
+    ON pb.client_id = b.client_id 
+    AND pb.platform_id = b.platform_id 
+    AND pb.plan_id = b.plan_id

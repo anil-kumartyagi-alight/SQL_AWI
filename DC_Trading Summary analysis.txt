@@ -1,0 +1,585 @@
+--begin_date = '2024-12-01'
+--end_date = '2024-12-31'
+
+WITH mv_person
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,platform_id
+		,platform_person_internal_id
+		,gender
+		,birth_date
+		,person_reason_code
+		,union_name
+		,client_id_string
+		,row_level_security_filter_value
+		,begin_date
+		,end_date
+	FROM person_rpt.person
+	WHERE person_reason_code = 'Employee'
+		AND begin_date <= <<$pEndDate>>
+		AND end_date >= <<$pEndDate>>
+		AND client_id = cast(<<$pClientId>> as int)
+	)
+	,mv_person_employment
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,platform_person_internal_id
+		,platform_id
+		,expected_annual_base_salary
+		,hourly_salary_status
+		,fulltime_parttime_status
+		--,employment_status
+		,begin_date
+		,end_date
+		,hire_date
+		,termination_date
+		,standard_value AS employment_status
+FROM person_rpt.person_employment pe
+LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+	ON pe.standard_employment_status_code = rl.standard_key
+	AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+	WHERE 
+		begin_date <= <<$pEndDate>>
+		AND end_date >= <<$pEndDate>>
+		AND client_id = cast(<<$pClientId>> as int)
+		AND UPPER(TRIM(standard_value)) in ('ACTIVE')
+	)
+	,
+	pcf
+AS (
+				select * from person_itg.person_custom_filter 
+				where client_id =cast(<<$pClientId>> as int)
+				and data_product = 'DC'
+				and begin_date <= <<$pEndDate>>
+				and end_date >= <<$pEndDate>>
+				)			
+
+	,person
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+		,p.client_id
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5
+		
+		,p.platform_person_internal_id
+		,e.expected_annual_base_salary
+		,e.hourly_salary_status
+		,e.fulltime_parttime_status
+		,e.employment_status
+		,p.person_reason_code
+		,p.union_name
+		,p.gender
+		,floor(CASE 
+			WHEN p.birth_date IN (
+					'1800-01-01'
+					,'1900-01-01'
+					,'1901-01-01'
+					,'1910-01-01'
+					,'1930-01-01'
+					)
+				THEN NULL
+			ELSE ROUND(DATEDIFF(DAY, p.birth_date, <<$pEndDate>>) / 365.25, 2)
+			END) AS age
+		,CASE 
+			WHEN p.person_reason_code = 'Employee'
+				AND upper(e.employment_status) = 'ACTIVE'
+				THEN ROUND(DATEDIFF(DAY, e.hire_date, <<$pEndDate>>) / 365.25, 2)
+			WHEN p.person_reason_code = 'Employee'
+				AND upper(e.employment_status) <> 'ACTIVE'
+				AND e.termination_date IS NOT NULL
+				AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+				THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+			ELSE NULL
+			END AS tenure
+	FROM mv_person p
+	inner JOIN mv_person_employment e ON p.client_id = e.client_id
+		AND p.platform_person_internal_id = e.platform_person_internal_id
+		AND p.platform_id = e.platform_id
+		AND p.client_id = cast(<<$pClientId>> as int)
+	left join pcf on p.platform_id = pcf.platform_id
+								and p.platform_person_internal_id = pcf.platform_person_internal_id
+								and p.client_id = pcf.client_id 
+    
+	)
+	,PRSN_PLANSTAT_DIMN01
+AS (
+	SELECT a.client_id AS CLIENT_ID
+		,a.platform_person_internal_id AS PRSN_INTN_ID
+		,a.category_id AS CAT_ID
+		,a.begin_date AS PP_STAT_EFBEG_DT
+		,a.end_date AS PP_STAT_EFEND_DT
+		,a.plan_status_code AS PLAN_STAT_CD
+		,a.participation_status_code AS prtc_stat_cd
+		,a.platform_indicator_code AS PLFM_IND_CD
+		,a.plan_id AS PLAN_ID
+		,b.category_type_code AS CAT_TYPE_CD
+		,MAX(begin_date) OVER (
+			PARTITION BY a.client_id
+			,a.plan_id
+			,a.platform_person_internal_id
+			,a.category_id
+			) AS MAX_PP_STAT_EFBEG_DT
+	FROM wealth_rpt.person_planstatus_dim a
+	INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+		AND a.category_id = b.category_id
+		AND a.plan_id = b.plan_id
+	WHERE
+		a.platform_indicator_code IN ('R3','R4','DCE') 
+		AND b.category_type_code = 'PS'
+		AND <<$pEndDate>> >= a.begin_date
+		AND <<$pEndDate>> <= a.end_date
+		AND b.category_definition_brand_code = 'PRTC-STAT'
+		AND a.client_id = cast(<<$pClientId>> as int)
+		AND TRIM(UPPER(a.participation_status_code)) = 'ACTIVE'
+	)
+	,PRSN_PLANSTAT_DIMN
+AS (
+	SELECT DISTINCT CLIENT_ID
+		,PLAN_ID
+		,CAT_ID
+		,PRSN_INTN_ID
+		,prtc_stat_cd
+		,plfm_ind_cd
+		--,CAT_TYPE_CD
+		,MAX_PP_STAT_EFBEG_DT
+	FROM PRSN_PLANSTAT_DIMN01
+	WHERE MAX_PP_STAT_EFBEG_DT = PP_STAT_EFBEG_DT
+	)
+	,person_planstat
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+		,p.client_id
+		,p.platform_person_internal_id
+		,p.expected_annual_base_salary
+		,p.hourly_salary_status
+		,p.fulltime_parttime_status
+		,p.person_reason_code
+		,p.union_name
+		,p.gender
+		,p.employment_status
+		,p.age
+		,p.tenure
+		,d.prtc_stat_cd
+		,d.plfm_ind_cd
+		,d.plan_id
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	FROM prsn_planstat_dimn d
+	INNER JOIN person p ON p.client_id = d.client_id
+		AND p.platform_person_internal_id = d.prsn_intn_id
+	--WHERE d.plfm_ind_cd IN ('R3','R4','DCE'
+		--AND UPPER(TRIM(p.employment_status)) in ('TERMINATION','ACTIVE')
+		--AND UPPER(TRIM(prtc_stat_cd)) = 'ACTIVE'
+	)
+	,dc_plan_dimn
+AS (
+	SELECT client_id
+		,plan_brand_code as plan_brnd_cd
+		,plan_long_description as plan_ldsc_tx
+		,plan_type_code as plan_type_cd
+		,plan_id
+	FROM wealth_rpt.dc_plan_dim
+	WHERE client_id = cast(<<$pClientId>> as int)
+		AND plan_type_code = 'DC'
+	)
+	,person_data
+AS (
+	SELECT a.client_id
+		,a.platform_person_internal_id
+		,a.expected_annual_base_salary AS salary
+		,a.hourly_salary_status
+		,a.fulltime_parttime_status
+		,a.person_reason_code
+		,a.union_name
+		,a.gender
+		,a.employment_status
+		,(a.age) as age
+		,(a.tenure) as tenure
+		,a.prtc_stat_cd
+		,a.plfm_ind_cd
+		,a.plan_id
+		,b.plan_brnd_cd
+		,b.plan_ldsc_tx
+		,b.plan_type_cd
+		,a.client_id_string
+		,a.row_level_security_filter_value
+		,a.custom_filter_1
+		,a.custom_filter_2
+		,a.custom_filter_3
+		,a.custom_filter_4
+		,a.custom_filter_5
+	FROM person_planstat a
+	LEFT JOIN dc_plan_dimn b ON a.client_id = b.client_id
+		AND a.plan_id = b.plan_id
+	WHERE b.plan_type_cd = 'DC'
+	)
+	,range_lookup
+AS (
+	SELECT standard_group_key
+		,standard_display_name
+		,standard_min
+		,standard_max
+		,OWNER
+	FROM adlfound_itg.standard_ranges_lookup
+	)
+	,dc_person_attributes
+AS (
+	SELECT a.client_id
+		,a.platform_person_internal_id
+		,a.hourly_salary_status
+		,a.fulltime_parttime_status
+		,a.person_reason_code
+		,a.union_name
+		,a.gender
+		,a.employment_status
+		,a.prtc_stat_cd
+		,a.plfm_ind_cd
+		,a.plan_id
+		,a.plan_brnd_cd
+		,a.plan_ldsc_tx
+		,a.plan_type_cd
+		,a.age
+		,B.standard_display_name
+		,B.standard_display_name AS AGE_RANGE
+		,a.TENURE
+		,C.standard_display_name AS TENURE_RANGE
+		,a.salary
+		,D.standard_display_name AS SALARY_RANGE
+		,a.client_id_string
+		,a.row_level_security_filter_value
+		,a.custom_filter_1
+		,a.custom_filter_2
+		,a.custom_filter_3
+		,a.custom_filter_4
+		,a.custom_filter_5 
+	FROM person_data a
+	 LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'AGE_RANGE_DC'
+                                ) b ON floor(a.age)BETWEEN (b.standard_min)
+                                                AND(b.standard_max)
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'TENURE'
+                                ) C ON floor(a.tenure) BETWEEN (C.standard_min)
+                                                AND (C.standard_max)
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+                                ) D ON floor (a.salary) BETWEEN (D.standard_min)
+                                                AND (D.standard_max)
+	)
+	,join_person_balance
+AS (
+	SELECT DISTINCT p.client_id
+		,p.platform_person_internal_id
+		,p.salary
+		,p.SALARY_RANGE
+		,p.hourly_salary_status
+		,p.prtc_stat_cd
+		,employment_status
+		,p.fulltime_parttime_status
+		,p.union_name
+		,p.gender
+		,p.age
+		,p.AGE_RANGE
+		,p.tenure
+		,p.TENURE_RANGE
+		,p.plan_id
+		,p.plan_ldsc_tx
+		,p.plan_type_cd,
+		<<$pEndDate>> as reporting_month
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	FROM dc_person_attributes p 
+	)
+,fund_asset_mapping AS (
+	SELECT  
+		client_id,
+		plan_identifier,
+		fund_identifier,
+		asset_name,
+		asset_class_identifier
+	FROM
+		wealth_rpt.dc_icb_fund_asset_mapping
+	WHERE client_id IN (cast(<<$pClientId>> as int))
+		AND asset_class_identifier<>17
+		AND effective_begin_date <= <<$pEndDate>>
+		AND effective_end_date >= <<$pEndDate>>
+)
+,hard_balance_trnsfer_fund as
+    (SELECT hb.client_id AS client_id,
+		hb.plan_id AS plan_id,
+		hb.platform_person_internal_id,
+		hb.fund_id AS fund_id,
+		hdm.fund_long_description as fund_name,
+		SUM(managed_account_transfer_in+managed_account_transfer_out) AS managed_account_transfer_dollar,
+		SUM(participant_intiated_transfer_in+participant_intiated_transfer_out) AS participant_intiated_transfer_dollar,
+		SUM(auto_rebalance_transfer_in+auto_rebalance_transfer_out) AS auto_rebalance_transfer_dollar,
+		SUM(managed_account_transfer_count) as managed_account_transfer_count,
+		SUM(participant_intiated_transfer_count) as participant_intiated_transfer_count,
+		SUM(auto_rebalance_transfer_count) as auto_rebalance_transfer_count
+	FROM wealth_rpt.dc_hard_balance hb
+	INNER JOIN wealth_rpt.hardbalance_dim hdm 
+		ON hb.client_id = hdm.client_id
+		AND hb.plan_id = hdm.plan_id
+		AND hb.hard_balance_id = hdm.hardbalance_id
+		AND hb.fund_id = hdm.fund_id
+	INNER JOIN fund_asset_mapping asset
+		ON hdm.client_id = asset.client_id
+		AND hdm.fund_id = asset.fund_identifier
+		AND hdm.plan_id = asset.plan_identifier
+	WHERE accounting_activity_effective_date BETWEEN <<$pBeginDate>> AND <<$pEndDate>>
+		AND hb.client_id =  cast(<<$pClientId>> as int)	
+	GROUP BY 
+		hb.client_id,
+		hb.plan_id,
+		hb.fund_id,
+		hdm.fund_long_description,
+		hb.platform_person_internal_id
+	)
+	,
+hard_balance_trnsfer_balance as
+    (SELECT hb.client_id AS client_id,
+		hb.plan_id AS plan_id,
+		hb.platform_person_internal_id,
+		hb.fund_id AS fund_id,
+		hdm.fund_long_description as fund_name,
+		-- SUM(managed_account_transfer_in+managed_account_transfer_out) AS managed_account_transfer_dollar,
+		-- SUM(participant_intiated_transfer_in+participant_intiated_transfer_out) AS participant_intiated_transfer_dollar,
+		-- SUM(auto_rebalance_transfer_in+auto_rebalance_transfer_out) AS auto_rebalance_transfer_dollar,
+		-- SUM(managed_account_transfer_count) as managed_account_transfer_count,
+		-- SUM(participant_intiated_transfer_count) as participant_intiated_transfer_count,
+		-- SUM(auto_rebalance_transfer_count) as auto_rebalance_transfer_count,
+		SUM(hb.closing_units*bs.daily_price) AS plan_balance
+	FROM wealth_rpt.dc_hard_balance hb
+	INNER JOIN wealth_rpt.hardbalance_dim hdm 
+		ON hb.client_id = hdm.client_id
+		AND hb.plan_id = hdm.plan_id
+		AND hb.hard_balance_id = hdm.hardbalance_id
+		AND hb.fund_id = hdm.fund_id
+	INNER JOIN wealth_rpt.buysell_fund_prices bs
+		ON hb.client_id = bs.client_id 
+		AND hb.fund_id = bs.fund_id
+		AND bs.effective_date = <<$pEndDate>>
+	INNER JOIN fund_asset_mapping asset
+		ON hdm.client_id = asset.client_id
+		AND hdm.fund_id = asset.fund_identifier
+		AND hdm.plan_id = asset.plan_identifier
+	WHERE <<$pEndDate>> >= hb.begin_date
+		AND <<$pEndDate>> <= hb.end_date
+		AND hb.client_id = cast(<<$pClientId>> as int)
+	GROUP BY 
+		hb.client_id,
+		hb.plan_id,
+		hb.fund_id,
+		hdm.fund_long_description,
+		hb.platform_person_internal_id
+	--HAVING SUM(hb.closing_units*bs.daily_price) > 0
+	)--select count(*) from hard_balance_trnsfer_balance where fund_id = 1100;
+	,hard_balance_trnsfer_fund_ppt
+AS (
+	SELECT c.client_id AS client_id
+		,c.plan_id AS plan_id
+		,c.platform_person_internal_id
+		,d.platform_person_internal_id as platform_person_internal_id_bal
+		,c.fund_id AS fund_id
+		,c.fund_name
+		,c.managed_account_transfer_dollar
+		,c.participant_intiated_transfer_dollar
+		,c.auto_rebalance_transfer_dollar
+		,c.managed_account_transfer_count
+		,c.participant_intiated_transfer_count
+		,c.auto_rebalance_transfer_count
+	FROM hard_balance_trnsfer_fund c
+	FULL OUTER JOIN hard_balance_trnsfer_balance d 
+		ON c.client_id = d.client_id
+		AND c.plan_id = d.plan_id
+		AND c.platform_person_internal_id = d.platform_person_internal_id
+		AND c.fund_id = d.fund_id
+	)	
+	,join_person_hard_balance_transfer
+AS (
+	SELECT 
+		p.client_id
+		--,p.platform_person_internal_id
+		,p.SALARY_RANGE
+		,p.hourly_salary_status
+		,p.fulltime_parttime_status
+		,p.union_name
+		,p.gender
+		,p.AGE_RANGE
+		,p.TENURE_RANGE
+		,p.plan_id
+		,p.plan_ldsc_tx
+		,p.reporting_month
+		,c.fund_name
+		,c.fund_id
+		,SUM(managed_account_transfer_dollar+participant_intiated_transfer_dollar+auto_rebalance_transfer_dollar) AS total_transfer_dollar
+		,SUM(managed_account_transfer_count+participant_intiated_transfer_count+auto_rebalance_transfer_count) AS total_transfer_count
+		,SUM(c.managed_account_transfer_dollar) AS managed_account_transfer_dollar
+		,SUM(c.participant_intiated_transfer_dollar) AS participant_intiated_transfer_dollar
+		,SUM(c.auto_rebalance_transfer_dollar) AS auto_rebalance_transfer_dollar
+		,SUM(c.managed_account_transfer_count) AS managed_account_transfer_count
+		,SUM(c.participant_intiated_transfer_count) AS participant_intiated_transfer_count
+		,SUM(c.auto_rebalance_transfer_count) AS auto_rebalance_transfer_count
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	FROM 
+		join_person_balance p 
+	INNER JOIN hard_balance_trnsfer_fund c 
+		ON p.client_id = c.client_id
+		AND p.plan_id = c.plan_id
+		AND p.platform_person_internal_id = c.platform_person_internal_id	
+	GROUP BY p.client_id
+		,p.SALARY_RANGE
+		,p.hourly_salary_status
+		,p.fulltime_parttime_status
+		,p.union_name
+		,p.gender
+		,p.AGE_RANGE
+		,p.TENURE_RANGE
+		,p.plan_id
+		,p.plan_ldsc_tx
+		,p.reporting_month
+		,c.fund_name
+		,c.fund_id
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	)--select * from join_person_hard_balance_transfer where fund_id = 1140;
+	,join_person_hard_balance_ppt
+AS (
+	SELECT 
+		p.client_id
+		,COUNT(DISTINCT p.platform_person_internal_id) AS number_ppt_in_fund
+		,p.SALARY_RANGE
+		,p.hourly_salary_status
+		,p.fulltime_parttime_status
+		,p.union_name
+		,p.gender
+		,p.AGE_RANGE
+		,p.TENURE_RANGE
+		,p.plan_id
+		,p.plan_ldsc_tx
+		,p.reporting_month
+		,c.fund_name
+		,c.fund_id
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	FROM 
+		join_person_balance p 
+	INNER JOIN hard_balance_trnsfer_balance c 
+		ON p.client_id = c.client_id
+		AND p.plan_id = c.plan_id
+		AND p.platform_person_internal_id = c.platform_person_internal_id
+	WHERE plan_balance > 0
+	GROUP BY p.client_id
+		,p.SALARY_RANGE
+		,p.hourly_salary_status
+		,p.fulltime_parttime_status
+		,p.union_name
+		,p.gender
+		,p.AGE_RANGE
+		,p.TENURE_RANGE
+		,p.plan_id
+		,p.plan_ldsc_tx
+		,p.reporting_month
+		,c.fund_name
+		,c.fund_id
+		,p.client_id_string
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	)--select * from join_person_hard_balance_ppt where fund_id = 1140;
+	--select sum(number_ppt_in_fund) from join_person_hard_balance_ppt where fund_id = 1100;
+	,final_person_transfer
+AS(
+	SELECT 
+		COALESCE(a.client_id, b.client_id) AS client_id
+		,a.reporting_month AS reporting_month
+		,COALESCE(a.plan_ldsc_tx, b.plan_ldsc_tx) AS plan_ldsc_tx
+		,COALESCE(a.fund_name, b.fund_name) AS fund_name
+		,COALESCE(a.fund_id, b.fund_id) AS fund_id
+		,a.fulltime_parttime_status AS fulltime_parttime_status
+		,a.hourly_salary_status AS hourly_salary_status
+		,a.union_name AS union_name
+		,a.gender AS gender
+		,a.AGE_RANGE AS AGE_RANGE
+		,a.TENURE_RANGE AS TENURE_RANGE
+		,a.SALARY_RANGE AS SALARY_RANGE
+		,a.client_id_string AS client_id_string
+		,a.row_level_security_filter_value AS row_level_security_filter_value
+		,a.custom_filter_1 AS custom_filter_1
+		,a.custom_filter_2 AS custom_filter_2
+		,a.custom_filter_3 AS custom_filter_3
+		,a.custom_filter_4 AS custom_filter_4
+		,a.custom_filter_5 AS custom_filter_5
+		,b.number_ppt_in_fund AS number_ppt_in_fund
+		,a.total_transfer_dollar AS total_transfer_dollar
+		,a.total_transfer_count AS total_transfer_count
+		,a.managed_account_transfer_dollar AS managed_account_transfer_dollar
+		,a.participant_intiated_transfer_dollar AS participant_intiated_transfer_dollar
+		,a.auto_rebalance_transfer_dollar AS auto_rebalance_transfer_dollar
+		,a.managed_account_transfer_count AS managed_account_transfer_count
+		,a.participant_intiated_transfer_count AS participant_intiated_transfer_count
+		,a.auto_rebalance_transfer_count AS auto_rebalance_transfer_count
+	FROM join_person_hard_balance_transfer a
+	FULL OUTER JOIN join_person_hard_balance_ppt b
+		ON a.client_id = b.client_id
+		AND a.reporting_month = b.reporting_month
+		AND a.plan_ldsc_tx = b.plan_ldsc_tx
+		AND a.fund_name = b.fund_name
+		AND COALESCE(a.fulltime_parttime_status, 'NULL') = COALESCE(b.fulltime_parttime_status, 'NULL')
+		AND COALESCE(a.hourly_salary_status, 'NULL') = COALESCE(b.hourly_salary_status, 'NULL')
+		AND COALESCE(a.union_name,'NULL') = COALESCE(b.union_name,'NULL')
+		AND COALESCE(a.gender, 'NULL') = COALESCE(b.gender, 'NULL')
+		AND COALESCE(a.AGE_RANGE, 'NULL') = COALESCE(b.AGE_RANGE, 'NULL')
+		AND COALESCE(a.TENURE_RANGE, 'NULL') = COALESCE(b.TENURE_RANGE, 'NULL')
+		AND COALESCE(a.SALARY_RANGE , 'NULL')= COALESCE(b.SALARY_RANGE , 'NULL')
+		AND COALESCE(a.client_id_string, 'NULL') = COALESCE(b.client_id_string, 'NULL')
+		AND COALESCE(a.row_level_security_filter_value, 'NULL') = COALESCE(b.row_level_security_filter_value, 'NULL')
+		AND COALESCE(a.custom_filter_1, 'NULL') = COALESCE(b.custom_filter_1, 'NULL')
+		AND COALESCE(a.custom_filter_2, 'NULL') = COALESCE(b.custom_filter_2, 'NULL')
+		AND COALESCE(a.custom_filter_3, 'NULL') = COALESCE(b.custom_filter_3, 'NULL')
+		AND COALESCE(a.custom_filter_4, 'NULL') = COALESCE(b.custom_filter_4, 'NULL')
+		AND COALESCE(a.custom_filter_5, 'NULL') = COALESCE(b.custom_filter_5, 'NULL')
+	)
+select * FROM final_person_transfer

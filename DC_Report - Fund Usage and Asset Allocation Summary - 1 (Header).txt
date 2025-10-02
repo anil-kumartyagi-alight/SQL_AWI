@@ -1,0 +1,497 @@
+WITH 
+mv_person AS (
+    SELECT 
+        p.global_client_id,
+        p.global_person_id,
+        p.platform_id,
+        p.client_id,
+		p.client_id_string,
+        p.platform_person_internal_id,
+        p.gender,
+        p.birth_date,
+        p.person_reason_code,
+        p.union_name,
+		p.begin_date,
+		p.end_date
+    FROM person_rpt.person p
+    WHERE 
+        p.end_date >=last_day(<<$pAsOfDate>>)
+        AND p.begin_date <=last_day(<<$pAsOfDate>>)
+        --AND p.person_reason_code = 'Employee'
+        AND p.client_id = <<$pClientId>>
+),
+
+mv_person_employment AS (
+    SELECT 
+        e.global_client_id,
+        e.global_person_id,
+        e.platform_id,
+        e.client_id,
+        e.platform_person_internal_id,
+        e.expected_annual_base_salary,
+        e.hourly_salary_status,
+        e.fulltime_parttime_status,
+		e.standard_employment_status,
+        COALESCE(rl.standard_value, e.employment_status) AS employment_status,
+        e.hire_date,
+        e.termination_date
+    FROM person_rpt.person_employment e
+    LEFT JOIN adlfound_itg.standard_rollups_lookup rl
+        ON e.standard_employment_status_code = rl.standard_key
+        AND rl.standard_group_key = 'EMPL-STAT-CD-ROLLUP1'
+    WHERE 
+        e.begin_date <= last_day(<<$pAsOfDate>>)
+        AND e.end_date >= last_day(<<$pAsOfDate>>)
+        AND e.client_id = <<$pClientId>>
+),
+
+person AS (
+    SELECT 
+        p.*,
+		psf.row_level_security_filter_value,
+		pcf.custom_filter_1, 
+		pcf.custom_filter_2, 
+		pcf.custom_filter_3, 
+		pcf.custom_filter_4, 
+		pcf.custom_filter_5,
+        e.expected_annual_base_salary,
+        e.hourly_salary_status,
+        e.fulltime_parttime_status,
+        e.standard_employment_status,
+        FLOOR(CASE 
+            WHEN p.birth_date IN ('1800-01-01','1900-01-01','1901-01-01','1910-01-01','1930-01-01')
+                THEN NULL 
+                ELSE FLOOR(DATEDIFF(DAY, p.birth_date, last_day(<<$pAsOfDate>>)) / 365.25) 
+        END) AS age,
+        CASE 
+            WHEN p.person_reason_code = 'Employee' AND UPPER(e.employment_status) = 'ACTIVE'
+                THEN FLOOR(DATEDIFF(DAY, e.hire_date, last_day(<<$pAsOfDate>>)) / 365.25)
+            WHEN p.person_reason_code = 'Employee' AND UPPER(e.employment_status) <> 'ACTIVE'
+                AND e.termination_date IS NOT NULL
+                AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+                THEN FLOOR(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25)
+            ELSE NULL 
+        END AS tenure
+    FROM mv_person p
+    INNER JOIN mv_person_employment e ON 
+        p.client_id = e.client_id AND 
+        p.platform_id = e.platform_id AND 
+        p.platform_person_internal_id = e.platform_person_internal_id
+	left join person_itg.person_security_filter psf on p.platform_id = psf.platform_id
+    and p.platform_person_internal_id = psf.platform_person_internal_id
+	and p.client_id = psf.client_id 
+	--and psf.client_id = cast(<<$pClientId>> as int)
+	and psf.client_id = cast(<<$pClientId>> as int)	
+	
+	left join person_itg.person_custom_filter pcf on p.platform_id = pcf.platform_id
+    and p.platform_person_internal_id = pcf.platform_person_internal_id
+	and p.client_id = pcf.client_id
+    and <<$pAsOfDate>> <= pcf.end_date
+    and <<$pAsOfDate>> >= pcf.begin_date
+	--and pcf.client_id =cast(<<$pClientId>> as int)
+	and pcf.client_id =cast(<<$pClientId>> as int)	
+    and pcf.data_product = 'DC'
+),
+
+dc_plan_dimn AS (
+    SELECT 
+        platform_id,
+        client_id,
+        plan_brand_code AS plan_brnd_cd,
+        plan_long_description AS plan_ldsc_tx,
+        plan_type_code AS plan_type_cd,
+        plan_id
+    FROM wealth_rpt.dc_plan_dim
+    WHERE client_id = <<$pClientId>> AND plan_type_code = 'DC'
+),
+
+person_data AS (
+    SELECT 
+        a.*,
+        b.plan_brnd_cd,
+        b.plan_ldsc_tx,
+        b.plan_type_cd,
+		b.plan_id
+    FROM person a
+    LEFT JOIN dc_plan_dimn b ON 
+        a.client_id = b.client_id AND 
+        a.platform_id = b.platform_id 
+        -- AND a.plan_id = b.plan_id
+    WHERE b.plan_type_cd = 'DC'
+),
+
+range_lookup AS (
+    SELECT 
+        standard_group_key,
+        standard_display_name,
+        standard_min,
+        standard_max
+    FROM adlfound_itg.standard_ranges_lookup
+),
+
+dc_person_attributes AS (
+    SELECT 
+        a.*,
+        b.standard_display_name AS age_range,
+        c.standard_display_name AS tenure_range,
+        d.standard_display_name AS salary_range
+    FROM person_data a
+    LEFT JOIN range_lookup b ON (b.standard_group_key) = 'AGE_RANGE_DC' AND floor (a.age) BETWEEN (b.standard_min) AND(b.standard_max)
+    LEFT JOIN range_lookup c ON (c.standard_group_key)= 'TENURE' AND floor (a.tenure) BETWEEN(c.standard_min) AND (c.standard_max)
+    LEFT JOIN range_lookup d ON (d.standard_group_key) = 'SALARY_RANGE_WEALTH' AND floor (a.expected_annual_base_salary) BETWEEN (d.standard_min) AND(d.standard_max)
+),
+
+dc_hard_balance AS (
+    SELECT 
+        fb.global_client_id,
+        fb.global_person_id,
+        fb.platform_id,
+        fb.client_id,
+        fb.platform_person_internal_id,
+        fb.plan_id,
+        fb.fund_id,
+        hdm.fund_long_description,
+        fb.begin_date,
+        fb.end_date,
+        fb.closing_units
+    FROM wealth_rpt.dc_hard_balance fb
+    INNER JOIN (
+        SELECT DISTINCT client_id, plan_id, fund_id, fund_long_description, hardbalance_id, plan_type_code
+        FROM wealth_rpt.hardbalance_dim
+        WHERE client_id = <<$pClientId>> AND plan_type_code = 'DC'
+    ) hdm 
+    ON fb.client_id = hdm.client_id AND fb.plan_id = hdm.plan_id AND fb.fund_id = hdm.fund_id AND fb.hard_balance_id = hdm.hardbalance_id
+    WHERE fb.closing_units > 0
+        AND fb.client_id = <<$pClientId>>
+        -- AND fb.begin_date >= TO_DATE((EXTRACT(YEAR FROM CURRENT_DATE) - 3) || '-01-01', 'YYYY-MM-DD')
+        AND fb.end_date >= last_day(<<$pAsOfDate>>)
+        AND fb.begin_date <= last_day(<<$pAsOfDate>>)
+),
+
+bysl_fund_pr_fact AS (
+    SELECT 
+        platform_id, 
+        client_id, 
+        daily_price AS dly_pr, 
+        fund_id, 
+        effective_date AS eft_dt
+    FROM wealth_rpt.buysell_fund_prices
+    WHERE client_id = <<$pClientId>> AND effective_date =last_day(<<$pAsOfDate>>)
+),
+
+plan_balance AS (
+    SELECT 
+        j.*,
+        COALESCE(j.closing_units * b.dly_pr, 0) AS planbalance
+    FROM dc_hard_balance j
+    INNER JOIN bysl_fund_pr_fact b ON 
+        j.client_id = b.client_id AND 
+        j.platform_id = b.platform_id AND 
+        j.fund_id = b.fund_id
+),
+
+aggr_plan_balance AS (
+    SELECT 
+        global_client_id,
+        global_person_id,
+        platform_id,
+        client_id,
+        platform_person_internal_id,
+        plan_id,
+        fund_id,
+        fund_long_description,
+        SUM(planbalance) AS plan_balance
+    FROM plan_balance
+    GROUP BY global_client_id, global_person_id, platform_id, client_id, platform_person_internal_id, plan_id, fund_id, fund_long_description
+),
+
+JOIN_hbal_prsn AS (
+    SELECT 
+        p.global_client_id,
+        p.global_person_id,
+        p.platform_id,
+        p.client_id,
+		p.client_id_string,
+        p.platform_person_internal_id,
+        p.salary_range,
+        p.hourly_salary_status,
+        p.fulltime_parttime_status,
+        p.gender,
+        p.age_range,
+        p.tenure_range,
+        p.plan_id,
+		p.union_name,
+        pb.fund_id,
+        pb.fund_long_description,
+        p.plan_ldsc_tx AS plan_name,
+		p.standard_employment_status,
+		p.row_level_security_filter_value,
+		p.custom_filter_1, 
+		p.custom_filter_2, 
+		p.custom_filter_3, 
+		p.custom_filter_4, 
+		p.custom_filter_5,
+        SUM(pb.plan_balance) AS plan_balance,
+        p.plan_type_cd
+    FROM aggr_plan_balance pb
+    JOIN dc_person_attributes p ON 
+        pb.client_id = p.client_id AND 
+        pb.platform_id = p.platform_id AND 
+        pb.plan_id = p.plan_id AND 
+        pb.platform_person_internal_id = p.platform_person_internal_id
+    GROUP BY p.global_client_id, p.global_person_id, p.platform_id, p.client_id, p.client_id_string, p.platform_person_internal_id, 
+	p.salary_range, p.hourly_salary_status, p.fulltime_parttime_status, p.gender, p.age_range, p.tenure_range, p.plan_id, p.union_name, pb.fund_id, 
+	pb.fund_long_description, p.plan_ldsc_tx, p.plan_type_cd, p.standard_employment_status,
+	p.row_level_security_filter_value,
+		p.custom_filter_1, 
+		p.custom_filter_2, 
+		p.custom_filter_3, 
+		p.custom_filter_4, 
+		p.custom_filter_5
+)
+,
+
+asset_class_mapping AS (
+    SELECT DISTINCT client_id, plan_identifier AS plan_id, fund_identifier AS fund_id, asset_name, asset_class_identifier AS asset_class_id
+    FROM wealth_rpt.dc_icb_fund_asset_mapping
+    WHERE client_id = <<$pClientId>>
+	and effective_begin_date <= <<$pAsOfDate>>
+    and effective_end_date >= <<$pAsOfDate>>
+),
+
+JOIN_asset AS (
+    SELECT 
+        j.*,
+        ac.asset_class_id,
+        ac.asset_name
+    FROM JOIN_hbal_prsn j
+    LEFT JOIN asset_class_mapping ac ON 
+        j.client_id = ac.client_id AND 
+        j.plan_id = ac.plan_id AND 
+        j.fund_id = ac.fund_id
+    --WHERE ac.asset_class_id <> 17
+),
+
+JOIN_premix AS (
+    SELECT 
+        hbal.*,
+        premix.fund_equity_percentage AS fund_equity_pt
+    FROM JOIN_asset hbal
+    LEFT JOIN wealth_rpt.dc_premixed premix ON 
+        hbal.client_id = premix.client_id AND 
+        hbal.plan_id = premix.plan_id AND 
+        hbal.asset_class_id = premix.asset_class_id AND 
+        hbal.fund_id = premix.fund_id AND 
+        last_day(<<$pAsOfDate>>) BETWEEN premix.begin_date AND premix.end_date
+),
+
+EXP_Master_hbal_fact AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN asset_class_id = 4 THEN COALESCE(plan_balance * 0.6, 0)
+            WHEN asset_class_id = 5 THEN COALESCE(plan_balance * fund_equity_pt, 0)
+            WHEN asset_class_id IN (6,7,8,9,10,11,12) THEN COALESCE(plan_balance, 0)
+            WHEN asset_class_id = 13 THEN COALESCE(plan_balance * 0.5, 0)
+            ELSE 0 
+        END AS participant_bal_in_equity
+    FROM JOIN_premix
+),
+
+agg_plan_ppt_group AS (
+    SELECT 
+        global_client_id,
+        global_person_id,
+        platform_id,
+        client_id,
+		union_name,
+        platform_person_internal_id,
+        plan_id,
+		fulltime_parttime_status,
+		hourly_salary_status,
+		row_level_security_filter_value, standard_employment_status,
+		custom_filter_1, 
+		custom_filter_2, 
+		custom_filter_3, 
+		custom_filter_4, 
+		custom_filter_5,
+        SUM(plan_balance) AS partcipant_plan_balance_amount,
+        SUM(CASE WHEN TRIM(asset_name) = 'Company Stock' THEN plan_balance ELSE 0 END) AS partcipant_company_stock_balance,
+        COUNT(DISTINCT fund_id) AS partcipant_fund_count
+    FROM EXP_Master_hbal_fact
+    GROUP BY global_client_id, global_person_id, platform_id, client_id, union_name, platform_person_internal_id, plan_id, fulltime_parttime_status, hourly_salary_status,
+	row_level_security_filter_value, standard_employment_status,
+		custom_filter_1, 
+		custom_filter_2, 
+		custom_filter_3, 
+		custom_filter_4, 
+		custom_filter_5
+),
+
+EXP_plan_ppt_group AS (
+    SELECT 
+        *,
+        COALESCE(partcipant_company_stock_balance / NULLIF(partcipant_plan_balance_amount, 0) * 100, 0) AS partcipant_company_stock_percent
+    FROM agg_plan_ppt_group
+),
+
+EXP_plan_ppt_group_bucket AS (
+    SELECT 
+        A.*,
+        b.standard_display_name AS plan_balance_range,
+        CASE 
+            WHEN CAST(A.partcipant_company_stock_percent AS DECIMAL(12,4)) = 0 THEN '0%'
+            WHEN A.partcipant_company_stock_percent > 0 AND A.partcipant_company_stock_percent < 20 THEN '1% - 19%'
+            WHEN A.partcipant_company_stock_percent >= 20 AND A.partcipant_company_stock_percent < 50 THEN '20% - 49%'
+            WHEN A.partcipant_company_stock_percent >= 50 AND A.partcipant_company_stock_percent < 75 THEN '50% - 74%'
+            WHEN A.partcipant_company_stock_percent >= 75 AND A.partcipant_company_stock_percent < 100 THEN '75% - 99%'
+            WHEN A.partcipant_company_stock_percent >= 100 THEN '100%'
+            ELSE 'NA' 
+        END AS compny_stock_percent_bucket
+    FROM EXP_plan_ppt_group A
+    LEFT JOIN range_lookup b ON 
+        b.standard_group_key = 'PLAN_BALANCE_DC' AND 
+        A.partcipant_plan_balance_amount BETWEEN CAST(b.standard_min AS BIGINT) AND CAST(b.standard_max AS BIGINT)
+),
+
+join_master_bkts AS (
+    SELECT 
+        master.*,
+        bkts.plan_balance_range,
+        bkts.compny_stock_percent_bucket,
+        bkts.partcipant_fund_count,
+        bkts.partcipant_plan_balance_amount,
+		--.union_name,
+		--bkts.fulltime_parttime_status,
+		--bkts.hourly_salary_status,
+        COALESCE(master.plan_balance / NULLIF(bkts.partcipant_plan_balance_amount, 0) * 100, 0) AS participant_percent_amount_in_each_fund
+    FROM EXP_Master_hbal_fact master
+    INNER JOIN EXP_plan_ppt_group_bucket bkts ON 
+        master.client_id = bkts.client_id AND 
+        master.platform_id = bkts.platform_id AND 
+        master.platform_person_internal_id = bkts.platform_person_internal_id AND 
+        master.plan_id = bkts.plan_id
+),
+
+agg_asset_ppt_group AS (
+    SELECT 
+        global_client_id,
+        global_person_id,
+        platform_id,
+        client_id,
+        platform_person_internal_id,
+        plan_id,
+        asset_class_id,
+        SUM(plan_balance) AS asset_balance_amount
+    FROM EXP_Master_hbal_fact
+    GROUP BY global_client_id, global_person_id, platform_id, client_id, platform_person_internal_id, plan_id, asset_class_id
+),
+
+join_ppt_asset_percent AS (
+    SELECT 
+        agg_asset.*,
+        exp_plan.partcipant_plan_balance_amount,
+        COALESCE(agg_asset.asset_balance_amount / NULLIF(exp_plan.partcipant_plan_balance_amount, 0) * 100, 0) AS participant_percent_amount_in_each_asset
+    FROM agg_asset_ppt_group agg_asset
+    INNER JOIN EXP_plan_ppt_group exp_plan ON 
+        agg_asset.client_id = exp_plan.client_id AND 
+        agg_asset.platform_id = exp_plan.platform_id AND 
+        agg_asset.platform_person_internal_id = exp_plan.platform_person_internal_id AND 
+        agg_asset.plan_id = exp_plan.plan_id
+),
+
+join_master_asset_percnt AS (
+    SELECT 
+        master.*,
+        asset_perc.participant_percent_amount_in_each_asset
+    FROM join_master_bkts master
+    INNER JOIN join_ppt_asset_percent asset_perc ON 
+        master.client_id = asset_perc.client_id AND 
+        master.platform_id = asset_perc.platform_id AND 
+        master.platform_person_internal_id = asset_perc.platform_person_internal_id AND 
+        master.plan_id = asset_perc.plan_id AND 
+        master.asset_class_id = asset_perc.asset_class_id
+),
+
+EXP_master_data AS (
+    SELECT 
+        global_client_id,
+        global_person_id,
+        platform_id,
+        client_id,
+		client_id_string,
+		row_level_security_filter_value, standard_employment_status,
+		custom_filter_1,
+		custom_filter_2,
+		custom_filter_3,
+		custom_filter_4,
+		custom_filter_5,
+        plan_id,
+        plan_name,
+        fund_id,
+		union_name,
+		fulltime_parttime_status,
+		hourly_salary_status,
+        fund_long_description,
+        asset_class_id,
+        asset_name,
+        gender,
+        age_range,
+        salary_range,
+        tenure_range,
+        plan_balance_range,
+        compny_stock_percent_bucket,
+        platform_person_internal_id,
+        cast(plan_balance AS DECIMAL(22,7)) AS plan_balance,
+        partcipant_fund_count,
+        cast(participant_bal_in_equity AS DECIMAL(22,7)) AS participant_bal_in_equity,
+        COALESCE(participant_bal_in_equity / plan_balance, 0) AS participant_bal_per_in_equity,
+        participant_percent_amount_in_each_asset,
+        participant_percent_amount_in_each_fund
+    FROM join_master_asset_percnt
+) 
+	SELECT plan_id,
+		plan_name,
+		client_id_string,
+		age_range,
+        salary_range,
+        tenure_range,
+		gender,
+		union_name,
+		fulltime_parttime_status,
+		hourly_salary_status,
+		plan_balance_range,
+		standard_employment_status as employment_status,
+		custom_filter_1,
+		custom_filter_2,
+		custom_filter_3,
+		custom_filter_4,
+		custom_filter_5,
+		row_level_security_filter_value,
+		--round(sum(plan_balance) * 1.0 / NULLIF(COUNT(DISTINCT platform_person_internal_id), 0), 2) AS average_balance,
+		sum(plan_balance) average_balance_numr,
+		NULLIF(COUNT(DISTINCT platform_person_internal_id), 0) AS average_balance_denom,
+		COUNT(fund_id) AS Average_Number_of_Funds_per_Participant_numr,
+		NULLIF(COUNT(DISTINCT platform_person_internal_id), 0) AS Average_Number_of_Funds_per_Participant_denom,
+		SUM(participant_bal_in_equity) AS Total_Plan_Balance_in_Equities_Dollar,
+		SUM(participant_bal_in_equity) AS Total_Plan_Balance_in_Equities_Percent_numr,
+		NULLIF(SUM(plan_balance), 0) AS Total_Plan_Balance_in_Equities_Percent_denom
+	FROM EXP_master_data
+	GROUP BY plan_id,
+		plan_name,
+		client_id_string,
+		age_range,
+        salary_range,
+        tenure_range,
+		gender,
+		union_name,
+		fulltime_parttime_status,
+		hourly_salary_status,
+		plan_balance_range,
+		standard_employment_status,
+		custom_filter_1,
+		custom_filter_2,
+		custom_filter_3,
+		custom_filter_4,
+		custom_filter_5,
+		row_level_security_filter_value

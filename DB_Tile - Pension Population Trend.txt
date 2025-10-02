@@ -1,0 +1,470 @@
+with
+ Exp_Calen_yza as ( SELECT DISTINCT last_day(calendar_date)::date AS cal_dt, calendar_year,
+    dateadd(day, 1, last_day(dateadd(month, -1, calendar_date))) AS first_dt
+FROM adlfound_itg.calendar Calen_yza
+WHERE calendar_date=CAST(
+  DATE_TRUNC('month', DATE_TRUNC('year', CURRENT_DATE) - INTERVAL '2 year' + INTERVAL '11 months') + INTERVAL '1 month' - INTERVAL '1 day'
+AS DATE) or calendar_date=CAST(
+  DATE_TRUNC('month', DATE_TRUNC('year', CURRENT_DATE) - INTERVAL '1 year' + INTERVAL '11 months') + INTERVAL '1 month' - INTERVAL '1 day'
+AS DATE) or  calendar_date=DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 day'
+),
+
+mv_person AS ( SELECT DISTINCT client_id, platform_id,platform_person_internal_id,person_reason_code,begin_date,end_date, row_level_security_filter_value as row_level_security_filter_value, client_id_string, cal_dt  as report_date
+FROM person_rpt.person PRSN_DIMN7
+inner join Exp_Calen_yza 
+on 
+begin_date <= date(cal_dt)
+AND end_date >= date(cal_dt)
+WHERE client_id = cast(<<$pClientId>> as int)
+)
+--select * from mv_person order by platform_person_internal_id,begin_date,begin_date,report_date
+,
+mv_person_employment as (SELECT DISTINCT client_id,platform_person_internal_id,platform_id,employment_status,standard_value as roll_up_1, cal_dt  as report_date
+ FROM person_rpt.person_employment e 
+ inner join  Exp_Calen_yza 
+ on 
+ begin_date <= cal_dt
+AND end_date >= cal_dt 
+left join (select distinct standard_key,standard_value from adlfound_itg.standard_rollups_lookup where 
+standard_group_key in ('EMPL-STAT-CD-ROLLUP1') ) s
+on trim(standard_employment_status_code)=(standard_key)
+WHERE client_id = cast(<<$pClientId>> as int)
+)
+,
+
+db_person_attributes AS (SELECT p.client_id, p.platform_id,p.platform_person_internal_id,e.roll_up_1 as employment_status,p.person_reason_code,p.row_level_security_filter_value,p.begin_date,p.end_date, p.client_id_string,p.report_date
+FROM mv_person p inner JOIN mv_person_employment e ON p.client_id = e.client_id
+ AND p.platform_person_internal_id = e.platform_person_internal_id 
+ AND p.platform_id = e.platform_id
+ and p.report_date=e.report_date
+WHERE p.client_id = cast(<<$pClientId>> as int)
+)
+,
+db_plan_dim as ( select distinct client_id,plan_id,plan_ldsc_tx from wealth_rpt.db_plan_dim where client_id=<<$pClientId>>
+),
+
+PRSN_PLANSTAT_DIMN01 AS ( SELECT a.client_id, a.platform_id, a.platform_person_internal_id AS PRSN_INTN_ID, plan_status_description, a.plan_id
+  ,c.plan_ldsc_tx as Plan_Description ,cal_dt  as report_date
+ FROM wealth_rpt.person_planstatus_dim a  INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+  AND a.category_id = b.category_id AND a.plan_id = b.plan_id  INNER JOIN wealth_rpt.db_plan_dim c on  a.client_id = c.client_id AND a.plan_id = c.plan_id 
+  inner join Exp_Calen_yza cal 
+  on 
+   a.begin_date <= cal_dt
+AND a.end_date >= cal_dt
+  WHERE a.platform_indicator_code IN ('R3','R4','DBE') AND b.category_type_code = 'PS'
+  and a.plan_status_code='UNAV'
+  AND b.category_definition_brand_code = 'DB-AVLB' AND a.client_id =<<$pClientId>>
+ ),
+ 
+ query_db_payments As (select distinct client_id,platform_id,  platform_person_internal_id  ,payment_effective_date,plan_id,plan,
+sum(total_payment_amount) as total_payment_amount
+from wealth_rpt.db_payments 
+  where client_id= cast(<<$pClientId>> as int) 
+and payment_instruction_status_code ='A' 
+and convert_timezone('CST', payment_effective_date) >= '1800-01-01'
+group by client_id,platform_id,   platform_person_internal_id  ,payment_effective_date,plan_id,plan
+),
+
+Shortcut_to_Pension_Popu_Elig_Current_All AS ( 
+SELECT DISTINCT 
+  DB_ELIG_A_FACT11.client_id,
+  DB_ELIG_A_FACT11.platform_id,
+  DB_ELIG_A_FACT11.platform_person_internal_id AS PRSN_INTN_ID,
+  DB_ELIG_A_FACT11.plan_id AS PLAN_ID,
+  DB_ELIG_A_FACT11.earliest_commencement_date_for_ccp AS earl_cmnc_dt_ccp,
+  DB_ELIG_A_FACT11.normal_retirement_date AS normal_retire_dt,
+  CASE 
+    WHEN DB_ELIG_A_FACT11.is_deferred_vested THEN 'Y' 
+    ELSE 'N' 
+  END AS is_deferred_vested,
+  DB_ELIG_A_FACT11.fully_vested_date,
+  DB_ELIG_A_FACT11.begin_date,
+  DB_ELIG_A_FACT11.end_date,
+  cal_dt  as report_date
+FROM wealth_rpt.db_person_plan DB_ELIG_A_FACT11
+inner join  Exp_Calen_yza cal 
+  on 
+   DB_ELIG_A_FACT11.begin_date <= cal_dt
+AND DB_ELIG_A_FACT11.end_date >= cal_dt
+
+WHERE DB_ELIG_A_FACT11.client_id = <<$pClientId>>
+
+),
+
+Pension_Participant_Data as (SELECT Person.platform_person_internal_id AS person_internal_id, Person.employment_status,
+	Person.person_reason_code, Person.row_level_security_filter_value, person.client_id_string, fully_vested_date,  Shortcut_to_Pension_Popu_Elig_Current_All.report_date as cal_dt,
+Shortcut_to_Pension_Popu_Elig_Current_All.plan_id, Shortcut_to_Pension_Popu_Elig_Current_All.client_id
+FROM db_person_attributes Person inner JOIN Shortcut_to_Pension_Popu_Elig_Current_All
+  ON Person.platform_person_internal_id = Shortcut_to_Pension_Popu_Elig_Current_All.PRSN_INTN_ID AND
+Person.client_id = Shortcut_to_Pension_Popu_Elig_Current_All.client_id
+AND Person.platform_id = Shortcut_to_Pension_Popu_Elig_Current_All.platform_id
+and Person.report_date = Shortcut_to_Pension_Popu_Elig_Current_All.report_date
+left JOIN db_plan_dim DB_Plan_Dimension on  Shortcut_to_Pension_Popu_Elig_Current_All.client_id=DB_Plan_Dimension.client_id
+and Shortcut_to_Pension_Popu_Elig_Current_All.PLAN_ID=DB_Plan_Dimension.plan_id
+left outer join PRSN_PLANSTAT_DIMN01 on PRSN_PLANSTAT_DIMN01.PLAN_ID=Shortcut_to_Pension_Popu_Elig_Current_All.PLAN_ID
+and PRSN_PLANSTAT_DIMN01.PRSN_INTN_ID=Shortcut_to_Pension_Popu_Elig_Current_All.PRSN_INTN_ID
+and PRSN_PLANSTAT_DIMN01.platform_id=Shortcut_to_Pension_Popu_Elig_Current_All.platform_id
+and PRSN_PLANSTAT_DIMN01.report_date = Shortcut_to_Pension_Popu_Elig_Current_All.report_date
+--inner join Exp_Calen_yza cal on cal.cal_dt between Person.begin_date and Person.end_date
+where PRSN_PLANSTAT_DIMN01.PRSN_INTN_ID is null )
+,
+Exp_db_ppt_1_elig_smry_yza as (SELECT client_id,plan_id,
+person_internal_id, fully_vested_date,last_day(fully_vested_date) AS reporting_month_dt, extract(year from fully_vested_date) as reporting_year, employment_status AS empl_stat, person_reason_code AS prsn_rsn_cd, cal_dt as rpt_fltr_1_desc,
+cast('Participant_Data' as VARCHAR) AS smry_dimn_type, cast('Vested_NonVested' as VARCHAR) AS smry_dimn_value,row_level_security_filter_value, client_id_string
+FROM Pension_Participant_Data WHERE upper(employment_status) ='ACTIVE' and fully_vested_date >= '1900-01-01'
+),
+
+Qry_Participant_Data_POT_1 as (select 
+COUNT(DISTINCT(CONCAT(CONCAT(query_db_payments.platform_person_internal_id,plan_id),extract(year from payment_effective_date))) ) AS Count0,'In_Payment' AS Category, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' AS Date0,person.row_level_security_filter_value, person.client_id_string
+from query_db_payments inner join db_person_attributes person  on
+   query_db_payments.client_id = person.client_id
+  AND query_db_payments.platform_person_internal_id = person.platform_person_internal_id
+    AND query_db_payments.platform_id = person.platform_id
+	and person.report_date =date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'
+
+where payment_effective_date <= cast(date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' as DATE) and
+extract (year from payment_effective_date)=extract (year from current_date)
+--and smry_dimn_value IN ('In_Payment')
+--and smry_dimn_type IN ('Participant_Data')
+--and prsn_rsn_cd <> 'N'
+--and rpt_fltr_1_desc = cast(date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' as DATE) 
+--and upper(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+GROUP BY Category, Date0,person.row_level_security_filter_value, person.client_id_string
+),
+
+Qry_Participant_Data_POT_2 as (select 
+count(distinct person_internal_id+plan_id) AS Count0,'Active - Vested' AS Category, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' AS Date0,row_level_security_filter_value, client_id_string
+from Exp_db_ppt_1_elig_smry_yza
+where reporting_month_dt <= cast(date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' as DATE)
+and smry_dimn_value IN ('Vested_NonVested')
+and smry_dimn_type IN ('Participant_Data')
+and prsn_rsn_cd <> 'N'
+and rpt_fltr_1_desc = cast(date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' as DATE) and upper(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+GROUP BY 2,3,4,5
+),
+
+Qry_Participant_Data_POT_3 as (
+select count(distinct person_internal_id+plan_id) AS Count0,
+'Active - Not Vested' AS Category, 
+date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' AS Date0,row_level_security_filter_value, client_id_string
+--select * 
+from Exp_db_ppt_1_elig_smry_yza
+where reporting_month_dt > cast(date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' as DATE)
+and smry_dimn_value IN ('Vested_NonVested')
+and smry_dimn_type IN ('Participant_Data')
+and prsn_rsn_cd <> 'N'
+and rpt_fltr_1_desc = cast(date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day' as DATE)
+and upper(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+GROUP by 2,3,4,5
+)
+,
+Qry_Participant_Data_POT_4 as (  select COUNT(DISTINCT(CONCAT(CONCAT(query_db_payments.platform_person_internal_id,plan_id),extract(year from payment_effective_date))) )  AS Count0, 'In_Payment' AS Category,
+DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day') AS Date0, person.row_level_security_filter_value, person.client_id_string
+from  query_db_payments inner join db_person_attributes person  on
+   query_db_payments.client_id = person.client_id
+  AND query_db_payments.platform_person_internal_id = person.platform_person_internal_id
+  AND query_db_payments.platform_id = person.platform_id
+  and extract(year from person.report_date) = EXTRACT(YEAR FROM DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+where extract(year from payment_effective_date) = EXTRACT(YEAR FROM DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+--and smry_dimn_value IN ('In_Payment')
+--and smry_dimn_type IN ('Participant_Data')
+--and prsn_rsn_cd <> 'N'
+--AND EXTRACT(YEAR FROM CAST(rpt_fltr_1_desc AS DATE)) = EXTRACT(YEAR FROM DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+--    AND EXTRACT(MONTH FROM CAST(rpt_fltr_1_desc AS DATE)) = 12
+--    AND UPPER(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+GROUP BY 2, 3,4,5
+),
+
+Qry_Participant_Data_POT_5 as ( select count(distinct person_internal_id+plan_id) AS Count0, 'Active - Vested' AS Category,
+DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day') AS Date0,row_level_security_filter_value, client_id_string
+from Exp_db_ppt_1_elig_smry_yza
+where reporting_year <= EXTRACT(YEAR FROM DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+and smry_dimn_value IN ('Vested_NonVested')
+and smry_dimn_type IN ('Participant_Data')
+and prsn_rsn_cd <> 'N'
+AND EXTRACT(YEAR FROM CAST(rpt_fltr_1_desc AS DATE)) = EXTRACT(YEAR FROM DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+    AND EXTRACT(MONTH FROM CAST(rpt_fltr_1_desc AS DATE)) = 12
+    AND UPPER(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+GROUP BY 2, 3,4,5
+),
+Qry_Participant_Data_POT_6 as (select count(distinct person_internal_id+plan_id) AS Count0, 'Active - Not Vested' AS Category, 
+ DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day') AS Date0,row_level_security_filter_value, client_id_string
+from Exp_db_ppt_1_elig_smry_yza
+where reporting_year > EXTRACT(YEAR FROM DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+and smry_dimn_value IN ('Vested_NonVested')
+and smry_dimn_type IN ('Participant_Data')
+and prsn_rsn_cd <> 'N'
+AND UPPER(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+    AND EXTRACT(YEAR FROM CAST(rpt_fltr_1_desc AS DATE)) = EXTRACT(YEAR FROM DATEADD(year, -1, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+    AND EXTRACT(MONTH FROM CAST(rpt_fltr_1_desc AS DATE)) = 12
+GROUP BY 2, 3,4,5
+)
+,
+Qry_Participant_Data_POT_7 AS (select COUNT(DISTINCT(CONCAT(CONCAT(query_db_payments.platform_person_internal_id,plan_id),extract(year from payment_effective_date))) ) AS Count0, 'In_Payment' AS Category,
+DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day') AS Date0, person.row_level_security_filter_value, person.client_id_string
+from  query_db_payments inner join db_person_attributes person  on
+   query_db_payments.client_id = person.client_id
+  AND query_db_payments.platform_person_internal_id = person.platform_person_internal_id
+  AND query_db_payments.platform_id = person.platform_id
+  and extract(year from person.report_date) = EXTRACT(YEAR FROM DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+where extract(year from payment_effective_date) = EXTRACT(YEAR FROM DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+--and smry_dimn_value IN ('In_Payment')
+--and smry_dimn_type IN ('Participant_Data')
+--and prsn_rsn_cd <> 'N'
+--AND EXTRACT(YEAR FROM CAST(rpt_fltr_1_desc AS DATE)) = EXTRACT(YEAR FROM DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+--    AND EXTRACT(MONTH FROM CAST(rpt_fltr_1_desc AS DATE)) = 12
+ --   AND UPPER(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+GROUP BY 2, 3,4,5
+),
+Qry_Participant_Data_POT_8 AS (select count(distinct person_internal_id+plan_id) AS Count0, 'Active - Vested' AS Category,
+DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day') AS Date0,row_level_security_filter_value, client_id_string
+from Exp_db_ppt_1_elig_smry_yza
+where reporting_year <= EXTRACT(YEAR FROM DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+and smry_dimn_value IN ('Vested_NonVested')
+and smry_dimn_type IN ('Participant_Data')
+and prsn_rsn_cd <> 'N'
+AND EXTRACT(YEAR FROM CAST(rpt_fltr_1_desc AS DATE)) = EXTRACT(YEAR FROM DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+    AND EXTRACT(MONTH FROM CAST(rpt_fltr_1_desc AS DATE)) = 12
+    AND UPPER(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+GROUP BY 2, 3,4,5
+),
+Qry_Participant_Data_POT_9 as (
+select count(distinct person_internal_id+plan_id) AS Count0, 'Active - Not Vested' AS Category, 
+DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day') AS Date0,row_level_security_filter_value, client_id_string
+from Exp_db_ppt_1_elig_smry_yza
+where reporting_year > EXTRACT(YEAR FROM DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+    AND smry_dimn_value IN ('Vested_NonVested')
+    AND prsn_rsn_cd <> 'N'
+    AND smry_dimn_type = 'Participant_Data'
+	AND UPPER(empl_stat) IN ('INACTIVE', 'NON-EMPLOYEE', 'ACTIVE')
+    AND EXTRACT(YEAR FROM CAST(rpt_fltr_1_desc AS DATE)) = EXTRACT(YEAR FROM DATEADD(year, -2, date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'))
+    AND EXTRACT(MONTH FROM CAST(rpt_fltr_1_desc AS DATE)) = 12
+GROUP BY 2, 3,4,5
+)
+, 
+Query10 AS 
+    (
+    SELECT
+        SUM(Union10.Count0) AS Count0, 
+        Union10.Category AS Category, 
+        Union10.Date0 AS Date0,
+		Union10.row_level_security_filter_value, Union10.client_id_string
+    FROM
+        (
+        SELECT
+            *
+        FROM
+            Qry_Participant_Data_POT_7
+        
+        UNION
+        
+        SELECT
+            *
+        FROM
+            Qry_Participant_Data_POT_8
+        ) Union10(Count0, Category, Date0,row_level_security_filter_value, client_id_string) 
+    GROUP BY 
+        Union10.Category, 
+        Union10.Date0,
+		Union10.row_level_security_filter_value, Union10.client_id_string
+    ), 
+Query5 AS 
+    (
+    SELECT
+        SUM(Union4.Count0) AS Count0, 
+        Union4.Category AS Category, 
+        Union4.Date0 AS Date0,
+		Union4.row_level_security_filter_value, Union4.client_id_string
+    FROM
+        (
+        SELECT
+            *
+        FROM
+            Qry_Participant_Data_POT_1
+        
+        UNION
+        
+        SELECT
+            *
+        FROM
+            Qry_Participant_Data_POT_2
+        ) Union4(Count0, Category, Date0,row_level_security_filter_value, client_id_string) 
+    GROUP BY 
+        Union4.Category, 
+        Union4.Date0,
+		Union4.row_level_security_filter_value, Union4.client_id_string
+    ), 
+Query6 AS 
+    (
+    SELECT
+        SUM(Union5.Count0) AS Count0, 
+        Union5.Category AS Category, 
+        Union5.Date0 AS Date0,
+		Union5.row_level_security_filter_value, Union5.client_id_string
+    FROM
+        (
+        SELECT
+            *
+        FROM
+            Qry_Participant_Data_POT_3
+        
+        UNION
+        
+        SELECT
+            *
+        FROM
+            Qry_Participant_Data_POT_4
+        ) Union5(Count0, Category, Date0,row_level_security_filter_value, client_id_string) 
+    GROUP BY 
+        Union5.Category, 
+        Union5.Date0,
+		Union5.row_level_security_filter_value, Union5.client_id_string
+    ), 
+Query7 AS 
+    (
+    SELECT
+        SUM(Union6.Count0) AS Count0, 
+        Union6.Category AS Category, 
+        Union6.Date0 AS Date0,
+		Union6.row_level_security_filter_value, Union6.client_id_string
+    FROM
+        (
+        SELECT
+            *
+        FROM
+            Qry_Participant_Data_POT_5
+        
+        UNION
+        
+        SELECT
+            *
+        FROM
+            Qry_Participant_Data_POT_6
+        ) Union6(Count0, Category, Date0,row_level_security_filter_value, client_id_string) 
+    GROUP BY 
+        Union6.Category, 
+        Union6.Date0,
+		Union6.row_level_security_filter_value, Union6.client_id_string
+    ), 
+Query8 AS 
+    (
+    SELECT
+        SUM(Union7.Count0) AS Count0, 
+        Union7.Category AS Category, 
+        Union7.Date0 AS Date0,
+		Union7.row_level_security_filter_value, Union7.client_id_string
+    FROM
+        (
+        SELECT
+            *
+        FROM
+            Query5
+        
+        UNION
+        
+        SELECT
+            *
+        FROM
+            Query6
+        ) Union7(Count0, Category, Date0,row_level_security_filter_value, client_id_string) 
+    GROUP BY 
+        Union7.Category, 
+        Union7.Date0,
+		Union7.row_level_security_filter_value, Union7.client_id_string
+    ), 
+Query9 AS 
+    (
+    SELECT
+        SUM(Union8.Count0) AS Count0, 
+        Union8.Category AS Category, 
+        Union8.Date0 AS Date0,
+		Union8.row_level_security_filter_value, Union8.client_id_string
+    FROM
+        (
+        SELECT
+            *
+        FROM
+            Query7
+        
+        UNION
+        
+        SELECT
+            *
+        FROM
+            Query8
+        ) Union8(Count0, Category, Date0,row_level_security_filter_value, client_id_string) 
+    GROUP BY 
+        Union8.Category, 
+        Union8.Date0,
+		Union8.row_level_security_filter_value, Union8.client_id_string
+    ), 
+Query11 AS 
+    (
+    SELECT
+        SUM(Union11.Count0) AS Count0, 
+        Union11.Category AS Category, 
+        Union11.Date0 AS Date0,
+		Union11.row_level_security_filter_value, Union11.client_id_string
+    FROM
+        (
+        SELECT
+            *
+        FROM
+            Query9
+        
+        UNION
+        
+        SELECT
+            *
+        FROM
+            Query10
+        ) Union11(Count0, Category, Date0,row_level_security_filter_value, client_id_string) 
+    GROUP BY 
+        Union11.Category, 
+        Union11.Date0,
+		Union11.row_level_security_filter_value, Union11.client_id_string
+    )
+SELECT
+    SUM(Union9.Count0) AS Count0, 
+    CASE 
+        WHEN Union9.Category = 'In_Payment' THEN 'In Payment'
+        WHEN Union9.Category = 'Deferred_Vested' THEN 'Deferred Vested'
+        WHEN '00994' IN ('1881', '5987') AND Union9.Category = 'Active - Not Vested' THEN 'Members in Waiting Period'
+        WHEN NOT ('00994' IN ('1881', '5987')) AND Union9.Category = 'Active - Not Vested' THEN Union9.Category
+        ELSE Union9.Category
+    END AS Category, 
+
+    CAST(
+        CASE 
+            WHEN EXTRACT(YEAR FROM date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day') = EXTRACT(YEAR FROM Union9.Date0)
+            THEN date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'
+            ELSE TO_DATE(EXTRACT(YEAR FROM Union9.Date0)::VARCHAR || '-12-31', 'YYYY-MM-DD')
+        END AS DATE
+    ) AS Date0,
+
+    TO_DATE(
+        EXTRACT(YEAR FROM 
+            CASE 
+                WHEN EXTRACT(YEAR FROM date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day') = EXTRACT(YEAR FROM Union9.Date0)
+                THEN date_trunc('month', add_months(current_date, -1)) + interval '1 month' - interval '1 day'
+                ELSE TO_DATE(EXTRACT(YEAR FROM Union9.Date0)::VARCHAR || '-12-31', 'YYYY-MM-DD')
+            END
+        )::VARCHAR || '-01-01', 'YYYY-MM-DD'
+    ) AS From_Date,
+
+    CAST('' AS VARCHAR(20)) AS To_Date, 
+    'Y' AS In_Payment, 
+    EXTRACT(YEAR FROM Union9.Date0) AS Date1,
+	Union9.row_level_security_filter_value, Union9.client_id_string
+
+FROM (
+    SELECT * FROM Query11
+    UNION
+    SELECT * FROM Qry_Participant_Data_POT_9
+) Union9(Count0, Category, Date0,row_level_security_filter_value, client_id_string)
+
+WHERE 
+    EXTRACT(YEAR FROM Union9.Date0) >= EXTRACT(YEAR FROM DATEADD(year, -2, current_date))
+
+GROUP BY 
+    2, 3, 4, 5, 6, 7, 8, 9

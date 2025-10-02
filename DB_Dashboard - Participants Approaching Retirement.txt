@@ -1,0 +1,308 @@
+-- Optimized version with performance improvements - All errors fixed
+WITH mv_person AS ( 
+  SELECT DISTINCT 
+    global_client_id, global_person_id, client_id, client_id_string, platform_id, 
+    platform_person_internal_id,
+    CASE WHEN birth_date IN (CAST('1800-01-01' AS DATE),CAST('1900-01-01' AS DATE),CAST('1901-01-01' AS DATE),CAST('1910-01-01' AS DATE),CAST('1930-01-01' AS DATE),CAST('0001-12-30 BC' AS DATE)) 
+         THEN NULL ELSE birth_date END AS birth_date,
+    last_name AS LAST_NM, first_name AS FRST_NM, middle_name AS MID_NM, 
+    person_reason_code, standard_gender AS gender, union_name, begin_date, end_date,
+    is_bad_preferred_address as BAD_ADDR_IND_CD, row_level_security_filter_value
+  FROM person_rpt.person 
+  WHERE person_reason_code IN ('Employee','QDRO','Beneficiary')
+    AND begin_date <= CAST(<<$pAsOfDate>> AS DATE)
+    AND end_date >= CAST(<<$pAsOfDate>> AS DATE)
+    AND client_id = CAST(<<$pClientId>> AS INT)
+), 
+
+mv_person_employment AS ( 
+  SELECT DISTINCT 
+    global_client_id, global_person_id, client_id, platform_person_internal_id, 
+    platform_id, s.standard_value as employment_status, s.standard_value AS roll_up_1,
+    fulltime_parttime_status, 
+    CAST(COALESCE(expected_annual_base_salary,0) AS NUMERIC(19,4)) as expected_annual_base_salary,
+    hourly_salary_status, employment_status_begin_date as effective_begin_date,
+    hire_date, termination_date, employee_id 
+  FROM person_rpt.person_employment e
+  LEFT JOIN ( 
+    SELECT DISTINCT standard_key, standard_value 
+    FROM adlfound_itg.standard_rollups_lookup 
+    WHERE standard_group_key = 'EMPL-STAT-CD-ROLLUP1' 
+  ) s ON TRIM(e.standard_employment_status_code) = s.standard_key
+  WHERE e.begin_date <= CAST(<<$pAsOfDate>> AS DATE)
+    AND e.end_date >= CAST(<<$pAsOfDate>> AS DATE) 
+    AND e.client_id = CAST(<<$pClientId>> AS INT)
+),
+
+-- Pre-filter and optimize custom filters
+pcf AS (
+  SELECT platform_id, platform_person_internal_id, client_id,
+         custom_filter_1, custom_filter_2, custom_filter_3, custom_filter_4, custom_filter_5
+  FROM person_itg.person_custom_filter 
+  WHERE client_id = CAST(<<$pClientId>> AS INT) 
+    AND data_product = 'DB' 
+    AND begin_date <= CAST(<<$pAsOfDate>> AS DATE)
+    AND end_date >= CAST(<<$pAsOfDate>> AS DATE)
+),
+
+-- Pre-calculate age and tenure in person CTE to avoid repeated calculations
+person AS (
+    SELECT 
+        p.global_client_id, p.global_person_id, p.client_id, p.platform_id, 
+        p.client_id_string, p.platform_person_internal_id, p.row_level_security_filter_value,
+        e.expected_annual_base_salary AS salary, e.hourly_salary_status, e.fulltime_parttime_status, 
+        e.roll_up_1 as employment_status, p.begin_date, p.end_date,
+        p.person_reason_code, p.union_name, p.gender, p.FRST_NM, p.MID_NM, p.LAST_NM, 
+        p.birth_date,
+        CASE WHEN p.person_reason_code = 'Employee' 
+                  AND UPPER(e.roll_up_1) <> 'ACTIVE' 
+                  AND e.termination_date IS NOT NULL 
+                  AND EXTRACT(YEAR FROM e.termination_date) <> 2299 
+             THEN e.termination_date 
+             ELSE NULL END AS termination_date,
+        e.hire_date, e.effective_begin_date, e.employee_id, e.roll_up_1,
+        -- Pre-calculate age once
+        FLOOR(CASE WHEN p.birth_date IN (CAST('1800-01-01' AS DATE),CAST('1900-01-01' AS DATE),CAST('1901-01-01' AS DATE),CAST('1910-01-01' AS DATE),CAST('1930-01-01' AS DATE)) 
+                   THEN NULL 
+                   ELSE ROUND(DATEDIFF(DAY, p.birth_date, CAST(<<$pAsOfDate>> AS DATE)) / 365.25, 2) 
+              END) AS age,
+        -- Pre-calculate tenure once
+        CASE WHEN p.person_reason_code = 'Employee' AND UPPER(e.roll_up_1) = 'ACTIVE' 
+             THEN ROUND(DATEDIFF(DAY, e.hire_date, CAST(<<$pAsOfDate>> AS DATE)) / 365.25, 2)
+             WHEN p.person_reason_code = 'Employee' 
+                  AND UPPER(e.roll_up_1) <> 'ACTIVE' 
+                  AND e.termination_date IS NOT NULL 
+                  AND EXTRACT(YEAR FROM e.termination_date) <> 2299 
+             THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+             ELSE NULL END AS tenure,
+        pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, 
+        pcf.custom_filter_4, pcf.custom_filter_5, p.BAD_ADDR_IND_CD
+    FROM mv_person p
+    LEFT JOIN mv_person_employment e 
+        ON p.client_id = e.client_id 
+        AND p.platform_person_internal_id = e.platform_person_internal_id 
+        AND p.platform_id = e.platform_id
+    LEFT JOIN pcf 
+        ON p.platform_id = pcf.platform_id 
+        AND p.platform_person_internal_id = pcf.platform_person_internal_id 
+        AND p.client_id = pcf.client_id
+),
+
+-- Optimize range lookups by pre-filtering
+age_ranges AS (
+    SELECT standard_display_name AS standard_display_value, standard_min, standard_max 
+    FROM adlfound_itg.standard_ranges_lookup 
+    WHERE standard_group_key = 'AGE_RANGE_DB'
+),
+tenure_ranges AS (
+    SELECT standard_display_name AS standard_display_value, standard_min, standard_max 
+    FROM adlfound_itg.standard_ranges_lookup 
+    WHERE standard_group_key = 'TENURE'
+),
+salary_ranges AS (
+    SELECT standard_display_name AS standard_display_value, standard_min, standard_max 
+    FROM adlfound_itg.standard_ranges_lookup 
+    WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+),
+
+db_person_attributes AS (
+    SELECT 
+        a.client_id, a.platform_id, a.client_id_string, a.platform_person_internal_id, 
+        a.salary, D.standard_display_value AS SALARY_RANGE, a.hourly_salary_status, 
+        a.fulltime_parttime_status, a.begin_date, a.end_date, a.employment_status, 
+        a.person_reason_code, a.union_name, a.gender, a.age,
+        B.standard_display_value AS AGE_RANGE, a.tenure, 
+        C.standard_display_value AS TENURE_RANGE, a.row_level_security_filter_value,
+        a.custom_filter_1, a.custom_filter_2, a.custom_filter_3, a.custom_filter_4, 
+        a.custom_filter_5, a.BAD_ADDR_IND_CD, a.FRST_NM, a.MID_NM, a.LAST_NM,
+        a.birth_date, a.termination_date, a.hire_date, a.effective_begin_date, a.employee_id
+    FROM person a
+    LEFT JOIN age_ranges B ON FLOOR(a.age) BETWEEN B.standard_min AND B.standard_max
+    LEFT JOIN tenure_ranges C ON FLOOR(a.tenure) BETWEEN C.standard_min AND C.standard_max
+    LEFT JOIN salary_ranges D ON FLOOR(a.salary) BETWEEN D.standard_min AND D.standard_max
+),
+
+-- Optimize plan dimension lookup
+db_plan_dim AS (
+    SELECT DISTINCT client_id, plan_id, plan_ldsc_tx 
+    FROM wealth_rpt.db_plan_dim 
+    WHERE client_id = <<$pClientId>>
+),
+
+-- Optimize plan status dimension
+PRSN_PLANSTAT_DIMN01 AS (  
+    SELECT DISTINCT a.client_id AS CLIENT_ID, a.platform_id, 
+           a.platform_person_internal_id AS PRSN_INTN_ID,
+           a.plan_status_description, a.plan_id AS PLAN_ID, c.plan_ldsc_tx as Plan_Description
+    FROM wealth_rpt.person_planstatus_dim a
+    INNER JOIN wealth_rpt.dc_category_dim b 
+        ON a.client_id = b.client_id  
+        AND a.category_id = b.category_id
+        AND a.plan_id = b.plan_id
+        AND b.category_type_code = 'PS' 
+        AND b.category_definition_brand_code = 'DB-AVLB'
+    INNER JOIN wealth_rpt.db_plan_dim c 
+        ON a.client_id = c.client_id  
+        AND a.plan_id = c.plan_id
+    WHERE a.platform_indicator_code IN ('R3','R4','DBE') 
+        AND a.plan_status_code = 'UNAV'
+        AND CAST(<<$pAsOfDate>> AS DATE) >= a.begin_date  
+        AND CAST(<<$pAsOfDate>> AS DATE) <= a.end_date
+        AND a.client_id = <<$pClientId>>
+),
+
+-- Optimize pension eligibility lookup 
+Shortcut_to_Pension_Popu_Elig_Current_All AS ( 
+    SELECT DISTINCT client_id, platform_id, 
+           platform_person_internal_id AS PRSN_INTN_ID, 
+           plan_id AS PLAN_ID, 
+           earliest_commencement_date_for_ccp AS earl_cmnc_dt_ccp, 
+           normal_retirement_date AS normal_retire_dt,
+           CASE WHEN is_deferred_vested THEN 'Y' ELSE 'N' END as is_deferred_vested		
+    FROM wealth_rpt.db_person_plan 
+    WHERE client_id = <<$pClientId>>
+),
+
+-- Optimize main participant data join
+Pension_Participant_Data AS (
+    SELECT 
+        Person.client_id_string, Person.platform_person_internal_id AS Internal_ID, 
+        Person.employment_status AS Employment_Status, Person.birth_date,	
+        Person.person_reason_code, Person.row_level_security_filter_value, 
+        Shortcut_to_Pension_Popu_Elig_Current_All.normal_retire_dt, 
+        Shortcut_to_Pension_Popu_Elig_Current_All.earl_cmnc_dt_ccp, 
+        Shortcut_to_Pension_Popu_Elig_Current_All.is_deferred_vested, 
+        Person.employment_status as empl_stat, 
+        DB_Plan_Dimension.plan_ldsc_tx as plan,
+        Person.SALARY_RANGE as salary_range, Person.AGE_RANGE as age_range, Person.TENURE_RANGE as tenure_range, Person.gender,
+        Person.hourly_salary_status, Person.fulltime_parttime_status, Person.union_name,
+        Person.custom_filter_1, Person.custom_filter_2, Person.custom_filter_3, 
+        Person.custom_filter_4, Person.custom_filter_5
+    FROM db_person_attributes Person
+    LEFT JOIN Shortcut_to_Pension_Popu_Elig_Current_All
+        ON Person.platform_person_internal_id = Shortcut_to_Pension_Popu_Elig_Current_All.PRSN_INTN_ID 
+        AND Person.client_id = Shortcut_to_Pension_Popu_Elig_Current_All.client_id
+        AND Person.platform_id = Shortcut_to_Pension_Popu_Elig_Current_All.platform_id
+    INNER JOIN db_plan_dim DB_Plan_Dimension
+        ON Shortcut_to_Pension_Popu_Elig_Current_All.client_id = DB_Plan_Dimension.client_id
+        AND Shortcut_to_Pension_Popu_Elig_Current_All.PLAN_ID = DB_Plan_Dimension.plan_id
+    LEFT JOIN PRSN_PLANSTAT_DIMN01 
+        ON PRSN_PLANSTAT_DIMN01.PLAN_ID = Shortcut_to_Pension_Popu_Elig_Current_All.PLAN_ID
+        AND PRSN_PLANSTAT_DIMN01.PRSN_INTN_ID = Shortcut_to_Pension_Popu_Elig_Current_All.PRSN_INTN_ID
+        AND PRSN_PLANSTAT_DIMN01.platform_id = Shortcut_to_Pension_Popu_Elig_Current_All.platform_id
+    WHERE PRSN_PLANSTAT_DIMN01.PRSN_INTN_ID IS NULL
+),
+
+-- Pre-calculate common date calculations and conditions
+date_calculations AS (
+    SELECT 
+        client_id_string, Internal_ID, Employment_Status, birth_date, person_reason_code,
+        row_level_security_filter_value, normal_retire_dt, earl_cmnc_dt_ccp, 
+        is_deferred_vested, empl_stat, plan, salary_range, age_range, tenure_range, 
+        gender, hourly_salary_status, fulltime_parttime_status, union_name,
+        custom_filter_1, custom_filter_2, custom_filter_3, custom_filter_4, custom_filter_5,
+        -- Pre-calculate key dates
+        CAST(DATEADD(MONTHS, 846, birth_date) AS DATE) AS key_date_70_5,
+        CAST(earl_cmnc_dt_ccp AS DATE) AS key_date_ecd,
+        CAST(normal_retire_dt AS DATE) AS key_date_nrd,
+        -- Pre-calculate date ranges
+        CAST(<<$pAsOfDate>> AS DATE) as as_of_date,
+        CAST(DATEADD(DAY, -1, DATEADD(MONTH, 4, CAST(<<$pAsOfDate>> AS DATE))) AS DATE) as three_months_end,
+        -- Pre-calculate employment status normalization
+        CASE WHEN UPPER(empl_stat) IN ('INACTIVE','DNM') THEN 'INACTIVE'
+             WHEN UPPER(empl_stat) IN ('ACTIVE') THEN 'ACTIVE'
+             ELSE empl_stat END AS normalized_empl_stat
+    FROM Pension_Participant_Data
+    WHERE person_reason_code IN ('Employee','QDRO','Beneficiary')
+)
+
+-- Final optimized result set
+SELECT * FROM (
+    -- 70.5 Active
+    SELECT 
+        client_id_string as client_id_string,
+        row_level_security_filter_value as row_level_security_filter_value,
+        'Approaching 70.5' as Dimension_Value1,
+        '3 Months - Active' as Dimension_Value2,
+        plan, salary_range, age_range, tenure_range, gender, hourly_salary_status,
+        fulltime_parttime_status, union_name, custom_filter_1, custom_filter_2, 
+        custom_filter_3, custom_filter_4, custom_filter_5, empl_stat,
+        Internal_ID as "Count"
+    FROM date_calculations
+    WHERE key_date_70_5 > as_of_date 
+        AND key_date_70_5 <= three_months_end
+        AND normalized_empl_stat = 'ACTIVE'
+    
+    UNION ALL
+    
+    -- 70.5 Inactive
+    SELECT 
+        client_id_string, row_level_security_filter_value,
+        'Approaching 70.5', '3 Months - Not Active',
+        plan, salary_range, age_range, tenure_range, gender, hourly_salary_status,
+        fulltime_parttime_status, union_name, custom_filter_1, custom_filter_2, 
+        custom_filter_3, custom_filter_4, custom_filter_5, empl_stat, Internal_ID
+    FROM date_calculations
+    WHERE key_date_70_5 > as_of_date 
+        AND key_date_70_5 <= three_months_end
+        AND normalized_empl_stat IN ('INACTIVE', 'DNM') 
+        AND is_deferred_vested = 'Y'
+    
+    UNION ALL
+    
+    -- ECD Active
+    SELECT 
+        client_id_string, row_level_security_filter_value,
+        'Earliest Commencement Date', '3 Months - Active',
+        plan, salary_range, age_range, tenure_range, gender, hourly_salary_status,
+        fulltime_parttime_status, union_name, custom_filter_1, custom_filter_2, 
+        custom_filter_3, custom_filter_4, custom_filter_5, empl_stat, Internal_ID
+    FROM date_calculations
+    WHERE key_date_ecd > as_of_date 
+        AND key_date_ecd <= three_months_end
+        AND normalized_empl_stat = 'ACTIVE'
+    
+    UNION ALL
+    
+    -- ECD Inactive
+    SELECT 
+        client_id_string, row_level_security_filter_value,
+        'Earliest Commencement Date', '3 Months - Not Active',
+        plan, salary_range, age_range, tenure_range, gender, hourly_salary_status,
+        fulltime_parttime_status, union_name, custom_filter_1, custom_filter_2, 
+        custom_filter_3, custom_filter_4, custom_filter_5, empl_stat, Internal_ID
+    FROM date_calculations
+    WHERE key_date_ecd > as_of_date 
+        AND key_date_ecd <= three_months_end
+        AND normalized_empl_stat IN ('INACTIVE', 'DNM') 
+        AND is_deferred_vested = 'Y'
+    
+    UNION ALL
+    
+    -- NRD Active
+    SELECT 
+        client_id_string, row_level_security_filter_value,
+        'Approaching NRD', '3 Months - Active',
+        plan, salary_range, age_range, tenure_range, gender, hourly_salary_status,
+        fulltime_parttime_status, union_name, custom_filter_1, custom_filter_2, 
+        custom_filter_3, custom_filter_4, custom_filter_5, empl_stat, Internal_ID
+    FROM date_calculations
+    WHERE key_date_nrd > as_of_date 
+        AND key_date_nrd <= three_months_end
+        AND normalized_empl_stat = 'ACTIVE'
+    
+    UNION ALL
+    
+    -- NRD Inactive
+    SELECT 
+        client_id_string, row_level_security_filter_value,
+        'Approaching NRD', '3 Months - Not Active',
+        plan, salary_range, age_range, tenure_range, gender, hourly_salary_status,
+        fulltime_parttime_status, union_name, custom_filter_1, custom_filter_2, 
+        custom_filter_3, custom_filter_4, custom_filter_5, empl_stat, Internal_ID
+    FROM date_calculations
+    WHERE key_date_nrd > as_of_date 
+        AND key_date_nrd <= three_months_end
+        AND normalized_empl_stat IN ('INACTIVE', 'DNM') 
+        AND is_deferred_vested = 'Y'
+) final_result

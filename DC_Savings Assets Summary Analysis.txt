@@ -1,0 +1,59 @@
+select
+person.client_id as Client_ID,
+person.client_id_string, 
+person.platform_person_internal_id as Person_Internal_ID,
+
+hbal_d.plan_ldsc_tx as Plan_Name,
+--ppstat.plan_stat_tx as Plan_Status,
+hbal_d.fund_ldsc_tx || '$' as Fund,
+hbal_d.acct_ldsc_tx || '$' as Account,
+(account.closing_balance_amount) AS Balance,
+psf.row_level_security_filter_value,
+pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5
+from (
+select platform_id, client_id,client_id_string, platform_person_internal_id, last_name, first_name, middle_name, gender, birth_date, person_reason_code, union_name,begin_date,end_date  from person_rpt.person 
+where 
+client_id = cast(<<$pClientId>> as int) and 
+<<$pAsOfDate>> between person.begin_date and person.end_date 
+)person 
+
+left join person_itg.person_security_filter psf on person.platform_id = psf.platform_id
+    and person.platform_person_internal_id = psf.platform_person_internal_id
+	and person.client_id = psf.client_id 
+	and psf.client_id =cast(<<$pClientId>> as int) 
+left join person_itg.person_custom_filter pcf on person.platform_id = pcf.platform_id
+    and person.platform_person_internal_id = pcf.platform_person_internal_id
+	and person.client_id = pcf.client_id
+    and <<$pAsOfDate>> <= pcf.end_date
+    and <<$pAsOfDate>> >= pcf.begin_date
+	and pcf.client_id =cast(<<$pClientId>> as int) 
+    and pcf.data_product = 'DC'
+
+inner join (select client_id, platform_id, platform_person_internal_id, plan_id, account_id, fund_id, effective_date, sum(closing_balance_amount) closing_balance_amount
+from wealth_rpt.dc_account_balances account where 
+client_id = cast(<<$pClientId>> as int) and 
+<<$pAsOfDate>> = effective_date and closing_balance_amount>0
+group by client_id, platform_id, platform_person_internal_id, plan_id, fund_id, account_id, effective_date
+) account on
+(
+person.client_id = account.client_id and 
+person.platform_id = account.platform_id and
+person.platform_person_internal_id = account.platform_person_internal_id  
+
+)
+left join (
+	
+	SELECT distinct client_id, plan_id, fund_long_description fund_ldsc_tx, fund_id, account_id acct_id, plan_long_description plan_ldsc_tx, account_long_description acct_ldsc_tx,
+ plan_type_code plan_type_cd
+    FROM wealth_rpt.hardbalance_dim
+	) 
+hbal_d on
+(
+hbal_d.client_id = account.client_id and 
+-- hbal_d.platform_id = account.platform_id and
+account.plan_id = hbal_d.plan_id  and
+account.fund_id = hbal_d.fund_id  and
+account.account_id = hbal_d.acct_id  and
+account.client_id = cast(<<$pClientId>> as int) and
+hbal_d.plan_type_cd = 'DC' 
+)

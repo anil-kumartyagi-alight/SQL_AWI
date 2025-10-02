@@ -1,0 +1,233 @@
+with main as (select Main_Query.*,
+AGE_RG.standard_display_name as Age_Range,
+salary_rg.standard_display_name as Salary_Range,
+tenure_rg.standard_display_name as Employment_Range,
+dc_vesting.vested_balance_amount as Vested_Plan_Balance_vested_balance_amount,
+dc_vesting.begin_date as Vesting_Refresh_Date
+
+	from (
+SELECT
+person.client_id as Client_ID,
+person.client_id_string,
+person.platform_id,
+--ltrim(to_char(person.client_id,'99999')) as client_id_string, 
+person.platform_person_internal_id as platform_person_internal_id,
+employee.employee_id  as Employee_ID ,
+person.last_name as Last_Name ,
+person.first_name as First_Name ,
+person.middle_name as Middle_Name ,
+person.gender  as Gender ,
+employee.expected_annual_base_salary  as Salary,
+floor(datediff(day, person.birth_date, <<$pAsOfDate>>)/365.25)  Age, 
+(CASE 
+                                                WHEN person.person_reason_code = 'Employee'
+                                                                AND upper(standard_rollup.standard_value) = 'ACTIVE'
+                                                                THEN ROUND(DATEDIFF(DAY, employee.hire_date, (<<$pAsOfDate>>)) / 365.25, 2)
+                                                WHEN person.person_reason_code = 'Employee'
+                                                                AND upper(standard_rollup.standard_value) <> 'ACTIVE'
+                                                                AND employee.termination_date IS NOT NULL
+                                                                AND EXTRACT(YEAR FROM employee.termination_date) <> 2299
+                                                                THEN ROUND(DATEDIFF(DAY, employee.hire_date, employee.termination_date) / 365.25, 2)
+                                                ELSE NULL
+                                                END) AS  Tenure, 
+
+person.birth_date as Birth_date,
+employee.hire_date as Hire_Date,
+person.person_reason_code as Person_Type ,
+employee.standard_employment_status  as Employment_Status ,
+employee.employment_status_begin_date as Employment_Status_Begin_Date ,
+employee.fulltime_parttime_status as FullTime_PartTime,
+employee.hourly_salary_status as Salary_Hourly,
+person.union_name as Union,
+hbal_d.plan_ldsc_tx as Plan_Name,
+ppstat.plan_stat_tx as Plan_Status,
+
+account.plan_id, 
+sum((account.closing_balance_amount)) AS Total_Plan_Balance,
+psf.row_level_security_filter_value,
+    pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5
+
+from (
+select platform_id, client_id,client_id_string, platform_person_internal_id, last_name, first_name, middle_name, gender, birth_date, person_reason_code, union_name,begin_date,end_date  from person_rpt.person 
+where 
+person.client_id =cast(<<$pClientId>> as int)   and 
+<<$pAsOfDate>> between person.begin_date and person.end_date 
+) person left outer join  person_rpt.person_employment employee
+on 
+(
+person.client_id = employee.client_id and 
+person.platform_id = employee.platform_id and
+person.platform_person_internal_id = employee.platform_person_internal_id and
+ employee.client_id =cast(<<$pClientId>> as int)  and
+<<$pAsOfDate>> between employee.begin_date and employee.end_date
+)
+LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup standard_rollup
+		ON employee.standard_employment_status_code = standard_rollup.standard_key
+		AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+
+left join person_itg.person_security_filter psf on person.platform_id = psf.platform_id
+    and person.platform_person_internal_id = psf.platform_person_internal_id
+	and person.client_id = psf.client_id 
+	and psf.client_id =cast(<<$pClientId>> as int) 
+left join person_itg.person_custom_filter pcf on person.platform_id = pcf.platform_id
+    and person.platform_person_internal_id = pcf.platform_person_internal_id
+	and person.client_id = pcf.client_id
+    and <<$pAsOfDate>> <= pcf.end_date
+    and <<$pAsOfDate>> >= pcf.begin_date
+	and pcf.client_id =cast(<<$pClientId>> as int) 
+    and pcf.data_product = 'DC'
+
+inner join (select distinct client_id, platform_id, platform_person_internal_id, plan_id,  account_id, effective_date, sum(closing_balance_amount) closing_balance_amount
+from wealth_rpt.dc_account_balances account where 
+client_id =cast(<<$pClientId>> as int)  and 
+<<$pAsOfDate>> = effective_date 
+group by client_id, platform_id, platform_person_internal_id, plan_id, account_id, effective_date
+) account on
+(
+person.client_id = account.client_id and 
+person.platform_id = account.platform_id and
+person.platform_person_internal_id = account.platform_person_internal_id  and
+account.client_id =cast(<<$pClientId>> as int)  and
+<<$pAsOfDate>> = account.effective_date 
+)
+left join 
+(
+    SELECT 
+a.client_id, a.platform_person_internal_id prsn_intn_id, a.category_id cat_id, a.begin_date pp_stat_efbeg_dt, a.end_date pp_stat_efend_dt, 
+a.plan_status_code plan_stat_cd, a.participation_status_code prtc_stat_cd, a.platform_indicator_code plfm_ind_cd, a.plan_id, 
+b.category_type_code cat_type_cd, a.plan_status_description plan_stat_tx
+
+--, a.platform_id 
+        FROM wealth_rpt.person_planstatus_dim a
+        INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id AND a.category_id = b.category_id AND a.plan_id = b.plan_id
+        WHERE a.platform_indicator_code IN ('R3', 'R4', 'DCE')
+            AND b.category_type_code = 'PS'
+            AND <<$pAsOfDate>> BETWEEN a.begin_date AND a.end_date
+            AND b.category_definition_brand_code = 'PRTC-STAT'
+             AND a.client_id =cast(<<$pClientId>> as int) 
+
+)
+ppstat on
+(
+ppstat.client_id = account.client_id and
+-- ppstat.platform_id = account.platform_id and
+ppstat.plan_id = account.plan_id  and
+ppstat.prsn_intn_id = account.platform_person_internal_id and
+ ppstat.client_id =cast(<<$pClientId>> as int)  and 
+<<$pAsOfDate>> between ppstat.PP_STAT_EFBEG_DT and ppstat.PP_STAT_EFEND_DT
+)
+
+left join (SELECT distinct client_id, plan_id, account_id acct_id, plan_long_description plan_ldsc_tx, account_long_description acct_ldsc_tx,
+ plan_type_code plan_type_cd
+    FROM wealth_rpt.hardbalance_dim) 
+hbal_d on
+(
+hbal_d.client_id = account.client_id and 
+--hbal_d.platform_id = account.platform_id and
+account.plan_id = hbal_d.plan_id  and
+account.account_id = hbal_d.acct_id  and
+account.client_id =cast(<<$pClientId>> as int)  and
+hbal_d.plan_type_cd = 'DC' 
+) 
+
+
+group BY
+
+person.client_id ,
+person.client_id_string,
+person.platform_id,
+person.platform_person_internal_id ,
+employee.employee_id   ,
+person.last_name  ,
+person.first_name  ,
+person.middle_name  ,
+person.gender  ,
+employee.expected_annual_base_salary  ,
+
+
+employee.termination_date,
+person.birth_date ,
+employee.hire_date ,
+person.person_reason_code ,
+employee.standard_employment_status  ,
+employee.employment_status_begin_date,
+employee.fulltime_parttime_status,
+employee.hourly_salary_status ,
+person.union_name,
+hbal_d.plan_ldsc_tx,
+ppstat.plan_stat_tx ,
+
+account.plan_id,
+standard_value,
+psf.row_level_security_filter_value,
+    pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5
+
+
+)Main_Query
+left  join 
+(
+SELECT *
+                                FROM adlfound_itg.standard_ranges_lookup
+                                WHERE standard_group_key = 'AGE_RANGE_DC'
+                                ) AGE_RG ON floor(Main_Query.Age) between AGE_RG.standard_min AND AGE_RG.standard_max 
+left  join
+(
+SELECT *
+                                FROM adlfound_itg.standard_ranges_lookup
+                                WHERE standard_group_key = 'TENURE'
+                                ) TENURE_RG ON floor(Main_Query.Tenure) >= TENURE_RG.standard_min 
+								AND  floor(Main_Query.Tenure) <= TENURE_RG.standard_max 
+LEFT JOIN (
+                                SELECT *
+                                FROM adlfound_itg.standard_ranges_lookup
+                                WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+                                ) salary_rg ON floor(Main_Query.Salary ) between salary_rg.standard_min AND salary_rg.standard_max 
+								
+								left join(
+    SELECT 
+    platform_person_internal_id, 
+    plan_id, 
+    begin_date,
+	vest_100_percent_date, 
+    sum(vested_balance_amount) vested_balance_amount
+
+    --SELECT distinct
+    --    platform_person_internal_id, 
+    --    plan_id, 
+    --    begin_date, 
+    --    (vested_balance_amount) vested_balance_amount,
+			
+	--	vest_100_percent_date
+    FROM
+        wealth_rpt.dc_vesting
+    WHERE 
+        
+        platform_indicator_code in ('R3','DCE','R4')
+		AND client_id =cast(<<$pClientId>> as int) 
+		and account_id = 0
+		and
+                begin_date = (
+        SELECT
+            MAX(begin_date) AS "MAX_DT"
+        FROM
+              wealth_rpt.dc_vesting
+        WHERE 
+            platform_indicator_code in ('R3','DCE','R4') AND
+            
+            begin_date <= <<$pAsOfDate>>  AND 
+			 client_id =cast(<<$pClientId>> as int)   and
+            NOT (begin_date IN ( 
+                '2299-12-31', 
+                '1800-01-01' ) )
+         )
+	group by platform_person_internal_id, 
+    plan_id, 
+    begin_date,
+	vest_100_percent_date
+		
+
+		) dc_vesting on dc_vesting.platform_person_internal_id = Main_Query.platform_person_internal_id
+		and dc_vesting.plan_id=Main_Query.plan_id
+		)
+		
+		select * from main

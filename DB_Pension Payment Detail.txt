@@ -1,0 +1,453 @@
+WITH
+Plan_Analytics_Pension_Payment_Detail AS
+    (
+    SELECT
+    DB_PMTDTL_A_FACT0.client_id AS client_id,
+	DB_PMTDTL_A_FACT0.platform_id AS platform_id,
+    DB_PMTDTL_A_FACT0.client_id_string AS client_id_string,
+    DB_PMTDTL_A_FACT0.row_level_security_filter_value AS row_level_security_filter_value,
+        DB_PMTDTL_A_FACT0.plan AS PLAN_LDSC_TX,
+        DB_PMTDTL_A_FACT0.payment_status AS PMT_STAT_TX,
+        DB_PMTDTL_A_FACT0.payment_description AS PMT_LDSC_TX,
+        benefit_commencement_date  AS BCD_DT,
+        DB_PMTDTL_A_FACT0.payment_effective_date AS PMT_EFT_DT,
+        DB_PMTDTL_A_FACT0.db_election AS DB_ELEC_LDSC_TX,
+        DB_PMTDTL_A_FACT0.service_period_end_date AS SV_PRD_END_DT,
+        DB_PMTDTL_A_FACT0.optional_form AS OPFM_LDSC_TX,
+        DB_PMTDTL_A_FACT0.optional_form_group AS OPFM_GP_LDSC_TX,
+        DB_PMTDTL_A_FACT0.optional_form_change_date AS OPFM_CHG_DT,
+        DB_PMTDTL_A_FACT0.optional_form_end_date AS OPFM_END_DT,
+        DB_PMTDTL_A_FACT0.after_tax_change_date AS ATAX_CHG_DT,
+        DB_PMTDTL_A_FACT0.after_tax_end_date AS ATAX_END_DT,
+        DB_PMTDTL_A_FACT0.payment_element AS ELMN_SDSC_TX,
+        DB_PMTDTL_A_FACT0.payment_adjustment_cd AS PMT_ADJ_CD,
+        DB_PMTDTL_A_FACT0.payment_id AS PMT_ID,
+        DB_PMTDTL_A_FACT0.platform_person_internal_id AS PRSN_INTN_ID,
+        DB_PMTDTL_A_FACT0.start_amount AS BNFT_STAR_LRG_AT,
+        DB_PMTDTL_A_FACT0.rollover_available_amount AS RLVR_AVLB_AT,
+        DB_PMTDTL_A_FACT0.continued_start_amount AS BNFT_CONT_STAR_AT,
+        DB_PMTDTL_A_FACT0.change_amount AS BNFT_CHG_AT,
+        DB_PMTDTL_A_FACT0.continued_change_amount AS BNFT_CONT_CHG_AT,
+        DB_PMTDTL_A_FACT0.pop_up_amount AS BNFT_POP_UP_AT,
+        DB_PMTDTL_A_FACT0.pop_up_change_amount AS POPU_CHG_AT,
+        DB_PMTDTL_A_FACT0.element_other_amount AS ELMN_OTHR_AT,
+        DB_PMTDTL_A_FACT0.after_tax_amount AS ATAX_AT,
+        DB_PMTDTL_A_FACT0.after_tax_change_amount AS ATAX_CHG_AT,
+        DB_PMTDTL_A_FACT0.total_payment_amount AS TOT_PMT_AT,
+        DB_PMTDTL_A_FACT0.payment_type AS PMT_TYPE,
+        case when DB_PMTDTL_A_FACT0.payment_destination='Drct_Dpst' then 'Direct Deposit'
+        when DB_PMTDTL_A_FACT0.payment_destination='Paper_Chk' then 'Paper check'
+        when DB_PMTDTL_A_FACT0.payment_destination='Rlvrs' then 'Rollovers'
+        when DB_PMTDTL_A_FACT0.payment_destination='Dflt_Rlvr' then 'Default Rollovers'
+        end as payment_destination,
+        DB_PMTDTL_A_FACT0.address_format_type_code,
+		DB_PMTDTL_A_FACT0.delivery_address_id
+    FROM
+        wealth_rpt.db_payments DB_PMTDTL_A_FACT0
+    WHERE
+        DB_PMTDTL_A_FACT0.payment_effective_date >= <<$pBeginDate>> AND
+        DB_PMTDTL_A_FACT0.payment_effective_date <= <<$pEndDate>>
+        and client_id= cast(<<$pClientId>> as  int)
+    )
+--select * from Plan_Analytics_Pension_Payment_Detail
+,
+addr_dim AS (
+select distinct address_id,address_long_description,address_format_type_description
+ 
+                FROM wealth_rpt.address_dim
+                WHERE client_id= cast(<<$pClientId>> as  int)),
+mv_person AS
+    (
+    SELECT
+    DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id, client_id_string
+                                ,platform_person_internal_id
+                                ,gender
+                                ,standard_gender AS SEX_CD
+                                ,CASE
+WHEN birth_date IN (
+'1800-01-01'
+,'1900-01-01'
+,'1901-01-01'
+,'1910-01-01'
+,'1930-01-01'
+,'0001-12-30 BC'
+) THEN NULL
+ELSE birth_date end as birth_date
+                                ,person_reason_code
+                                ,union_name
+                                ,platform_id
+                                ,begin_date
+                                ,end_date
+        ,PRSN_DIMN7.last_name AS LAST_NM
+        ,PRSN_DIMN7.first_name AS FRST_NM
+        ,PRSN_DIMN7.middle_name AS MID_NM
+       ,PRSN_DIMN7.is_bad_preferred_address  as BAD_ADDR_IND_CD
+       ,row_level_security_filter_value
+ 
+                FROM person_rpt.person PRSN_DIMN7
+                WHERE
+-- person_reason_code in( 'Employee','QDRO','Beneficiary' )AND
+                                begin_date <= <<$pEndDate>>
+                                AND end_date >= <<$pEndDate>>
+                                 AND client_id = cast(<<$pClientId>> as  int)
+    )
+--select * from mv_person
+,
+ 
+mv_person_employment
+AS (
+                SELECT DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id
+                                ,platform_person_internal_id
+								,platform_id
+                                ,expected_annual_base_salary
+                                ,hourly_salary_status
+                                ,fulltime_parttime_status
+                                ,standard_employment_status as employment_status
+                                ,hire_date
+                                , CASE WHEN termination_date IN ('1800-01-01','1900-01-01','0001-12-30 BC') THEN NULL ELSE termination_date end as termination_date
+                                ,begin_date as effective_begin_date
+                                ,employee_id
+                                ,standard_value as employment_status_roll_up_1
+                FROM person_rpt.person_employment
+                left join (select distinct standard_key,standard_value from adlfound_itg.standard_rollups_lookup where
+standard_group_key in ('EMPL-STAT-CD-ROLLUP1') ) s
+on trim(standard_employment_status_code)=(standard_key)
+                WHERE
+                --upper(trim(employment_status)) in  ('ACTIVE','INACTIVE')AND
+                begin_date <= <<$pEndDate>>
+                                AND end_date >= <<$pEndDate>>
+                                AND client_id = cast(<<$pClientId>> as  int)
+                )
+,
+pcf
+AS (
+                select * from person_itg.person_custom_filter
+                where client_id =cast(<<$pClientId>> as  int)
+                and data_product = 'DB'
+                and begin_date <= <<$pEndDate>>
+                     AND end_date >= <<$pEndDate>>
+                           
+                )          
+               
+                ,person
+AS (
+                SELECT p.global_client_id
+                                ,p.global_person_id
+                                ,p.client_id, p.client_id_string
+                                ,p.platform_person_internal_id
+								,p.platform_id
+                                ,e.expected_annual_base_salary as salary
+                                ,e.hourly_salary_status
+                                ,e.fulltime_parttime_status
+                                ,e.employment_status
+                                ,p.person_reason_code
+                                ,p.union_name
+                                ,p.gender
+                                ,p.FRST_NM
+                                ,p.MID_NM
+                                ,p.LAST_NM
+                                ,p.birth_date
+                                ,e.employment_status_roll_up_1
+                                ,case WHEN p.person_reason_code = 'Employee'
+                                  AND upper(e.employment_status_roll_up_1) <> 'ACTIVE'
+                                  AND e.termination_date IS NOT NULL
+                                  AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+                                   THEN e.termination_date else NULL END AS termination_date
+                                ,e.hire_date
+                                ,e.effective_begin_date
+                                ,e.employee_id
+                                ,FLOOR(CASE
+                                                WHEN p.birth_date IN (
+                                                                                '1800-01-01'
+                                                                                ,'1900-01-01'
+                                                                                ,'1901-01-01'
+                                                                                ,'1910-01-01'
+                                                                                ,'1930-01-01'
+                                                                                )
+                                                                THEN NULL
+                                                ELSE ROUND(DATEDIFF(DAY, p.birth_date, last_day(<<$pEndDate>>)) / 365.25, 2)
+                                                END) AS age
+                                ,CASE
+                                                WHEN p.person_reason_code = 'Employee'
+                                                                AND upper(e.employment_status_roll_up_1) = 'ACTIVE'
+                                                                THEN ROUND(DATEDIFF(DAY, e.hire_date, last_day(<<$pEndDate>>)) / 365.25, 2)
+                                                WHEN p.person_reason_code = 'Employee'
+                                                                AND upper(e.employment_status_roll_up_1) <> 'ACTIVE'
+                                                                AND e.termination_date IS NOT NULL
+                                                                AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+                                                                THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+                                                ELSE NULL
+                                                END AS tenure,
+                                 p.row_level_security_filter_value,
+    pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5,BAD_ADDR_IND_CD
+                FROM mv_person p
+                left  JOIN mv_person_employment e ON p.client_id = e.client_id
+                                AND p.platform_person_internal_id = e.platform_person_internal_id
+								AND p.platform_id = e.platform_id
+--                                AND p.global_client_id = e.global_client_id
+--                                AND p.global_person_id = e.global_person_id
+                                 AND p.client_id = cast(<<$pClientId>> as  int)
+               
+                left join pcf on p.platform_id = pcf.platform_id
+                                and p.platform_person_internal_id = pcf.platform_person_internal_id
+                                and p.client_id = pcf.client_id
+--                              and p.begin_date <= pcf.end_date
+--                              and p.end_date >= pcf.begin_date
+               
+               
+                )
+--select * from person
+,
+range_lookup
+AS (
+                SELECT standard_group_key
+                                ,standard_display_name standard_display_value
+                                ,standard_min
+                                ,standard_max
+                                ,OWNER
+                FROM adlfound_itg.standard_ranges_lookup
+                )
+,
+db_person_attributes
+AS (
+SELECT
+a.client_id
+,a.platform_id
+,a.client_id_string
+,a.platform_person_internal_id
+,a.salary
+,D.standard_display_value AS SALARY_RANGE
+,a.hourly_salary_status
+,a.fulltime_parttime_status
+,a.employment_status
+,a.person_reason_code
+,a.union_name
+,a.gender
+,a.age
+,B.standard_display_value AS AGE_RANGE
+,a.tenure
+,C.standard_display_value AS TENURE_RANGE
+,a.row_level_security_filter_value
+,a.custom_filter_1
+,a.custom_filter_2
+,a.custom_filter_3
+,a.custom_filter_4
+,a.custom_filter_5
+,a.BAD_ADDR_IND_CD
+,a.FRST_NM
+,a.MID_NM
+,a.LAST_NM
+,a.birth_date
+,a.termination_date
+,a.hire_date
+,a.effective_begin_date
+,a.employee_id
+                FROM person a
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'AGE_RANGE_DB'
+                                ) b ON floor(a.age) between b.standard_min AND b.standard_max
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'TENURE'
+                                ) C ON floor(a.tenure) between C.standard_min AND C.standard_max
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+                                ) D ON floor(a.salary) between D.standard_min AND D.standard_max
+                )
+--select * from db_person_attributes
+,
+main as
+( 
+SELECT
+dbpa.client_id,
+dbpa.platform_id,
+dbpa.client_id_string,
+    dbpa.platform_person_internal_id,
+employee_id,
+hourly_salary_status,
+fulltime_parttime_status,
+union_name,
+dbpa.row_level_security_filter_value,
+dbpa.custom_filter_1,
+dbpa.custom_filter_2,
+dbpa.custom_filter_3,
+dbpa.custom_filter_4,
+dbpa.custom_filter_5,
+dbpa.AGE_RANGE,
+dbpa.SALARY_RANGE,dbpa.salary,
+dbpa.TENURE_RANGE,
+    dbpa.LAST_NM AS Last_Name,
+    dbpa.FRST_NM AS First_Name,
+    dbpa.MID_NM AS Middle_Name,
+    dbpa.person_reason_code AS Person_Reason_Description,
+ dbpa.gender AS Gender,
+    dbpa.birth_date AS Birth_Date,
+    dbpa.age AS Age,
+    CAST(datediff(months, dbpa.birth_date, Plan_Analytics_Pension_Payment_Detail.BCD_DT) AS DOUBLE PRECISION) / 12 AS Age_at_Benefit_Commencement_Date,
+    CAST(datediff(months, dbpa.birth_date, dbpa.termination_date) AS DOUBLE PRECISION) / 12 AS Age_at_Termination_Date,
+    dbpa.termination_date AS Termination_Date,
+    MAX(dbpa.tenure) AS Length_of_Service,  
+    dbpa.employment_status AS Employment_Status_Description,
+    dbpa.effective_begin_date AS Employment_Status_Effective_Begin_Date,
+    dbpa.BAD_ADDR_IND_CD AS Bad_Address_Indicator,
+    Plan_Analytics_Pension_Payment_Detail.PLAN_LDSC_TX AS Pension_Plan,
+    CASE
+        WHEN UPPER(Plan_Analytics_Pension_Payment_Detail.PMT_TYPE) = 'ANNUITY' THEN 'Annuity'
+        WHEN UPPER(Plan_Analytics_Pension_Payment_Detail.PMT_TYPE) = 'LUMPSUM' THEN 'Lump Sum'
+        ELSE 'NA'
+    END AS Payment_Type_Description,
+    Plan_Analytics_Pension_Payment_Detail.PMT_STAT_TX AS Payment_Status_Description,
+    Plan_Analytics_Pension_Payment_Detail.PMT_LDSC_TX AS Payment_Description,
+    Plan_Analytics_Pension_Payment_Detail.BCD_DT AS Benefit_Commencement_Date,
+    Plan_Analytics_Pension_Payment_Detail.PMT_EFT_DT AS Payment_Effective_Date,
+    Plan_Analytics_Pension_Payment_Detail.DB_ELEC_LDSC_TX AS Election_Description,
+    Plan_Analytics_Pension_Payment_Detail.SV_PRD_END_DT AS Service_Period_End_Date,
+    Plan_Analytics_Pension_Payment_Detail.OPFM_LDSC_TX AS Optional_Form_Description,
+    Plan_Analytics_Pension_Payment_Detail.OPFM_GP_LDSC_TX AS Optional_Form_Group_Description,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.BNFT_STAR_LRG_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.BNFT_STAR_LRG_AT
+        END) AS Start_Amount,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.BNFT_CONT_STAR_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.BNFT_CONT_STAR_AT
+        END) AS Continued_Start_Amount,
+    Plan_Analytics_Pension_Payment_Detail.OPFM_CHG_DT AS Change_Date,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.BNFT_CHG_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.BNFT_CHG_AT
+        END) AS Change_Amount,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.BNFT_CONT_CHG_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.BNFT_CONT_CHG_AT
+        END) AS Continued_Change_Amount,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.BNFT_POP_UP_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.BNFT_POP_UP_AT
+        END) AS Pop_Up_Amount,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.POPU_CHG_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.POPU_CHG_AT
+        END) AS Pop_Up_Change_Amount,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.ELMN_OTHR_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.ELMN_OTHR_AT
+        END) AS Element_Other_Amount,
+    Plan_Analytics_Pension_Payment_Detail.OPFM_END_DT AS Optional_Form_End_Date,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.ATAX_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.ATAX_AT
+        END) AS After_Tax_Amount,
+    Plan_Analytics_Pension_Payment_Detail.ATAX_CHG_DT AS After_Tax_Change_Date,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.ATAX_CHG_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.ATAX_CHG_AT
+        END) AS After_Tax_Change_Amount,
+    Plan_Analytics_Pension_Payment_Detail.ATAX_END_DT AS After_Tax_End_Date,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.RLVR_AVLB_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.RLVR_AVLB_AT
+        END) AS Rollover_Available_Amount,
+    Plan_Analytics_Pension_Payment_Detail.ELMN_SDSC_TX AS Payment_Element,
+    SUM(
+        CASE
+            WHEN Plan_Analytics_Pension_Payment_Detail.TOT_PMT_AT IS NULL THEN 0.00
+            ELSE Plan_Analytics_Pension_Payment_Detail.TOT_PMT_AT
+        END) AS Payment_Amount,
+    Plan_Analytics_Pension_Payment_Detail.PMT_ADJ_CD AS Adjustment_Retro_Interest_Indicator,
+    Plan_Analytics_Pension_Payment_Detail.PMT_ID AS Payment_ID,
+    Plan_Analytics_Pension_Payment_Detail.payment_destination AS Payment_Destination,
+    Plan_Analytics_Pension_Payment_Detail.address_format_type_code,
+    addr.address_format_type_description,
+	addr.address_long_description,
+	Plan_Analytics_Pension_Payment_Detail.delivery_address_id
+FROM
+    Plan_Analytics_Pension_Payment_Detail
+        INNER JOIN db_person_attributes dbpa
+        ON
+            Plan_Analytics_Pension_Payment_Detail.PRSN_INTN_ID = dbpa.platform_person_internal_id
+			and Plan_Analytics_Pension_Payment_Detail.platform_id = dbpa.platform_id
+        left join addr_dim addr
+        on Plan_Analytics_Pension_Payment_Detail.delivery_address_id=addr.address_id
+WHERE
+    Plan_Analytics_Pension_Payment_Detail.TOT_PMT_AT > 0
+GROUP BY
+
+dbpa.client_id,
+dbpa.client_id_string,
+dbpa.platform_id,
+    dbpa.platform_person_internal_id,
+    employee_id,
+    hourly_salary_status,
+fulltime_parttime_status,
+union_name,
+    dbpa.row_level_security_filter_value,
+dbpa.custom_filter_1,
+dbpa.custom_filter_2,
+dbpa.custom_filter_3,
+dbpa.custom_filter_4,
+dbpa.custom_filter_5,
+dbpa.AGE_RANGE,
+dbpa.SALARY_RANGE,dbpa.salary,
+dbpa.TENURE_RANGE,
+    dbpa.LAST_NM ,
+    dbpa.FRST_NM,
+    dbpa.MID_NM,
+    dbpa.person_reason_code,
+ dbpa.gender,
+    dbpa.birth_date,
+    dbpa.age,
+    CAST(datediff(months, dbpa.birth_date, Plan_Analytics_Pension_Payment_Detail.BCD_DT) AS DOUBLE PRECISION) / 12 ,
+    CAST(datediff(months, dbpa.birth_date, dbpa.termination_date) AS DOUBLE PRECISION) / 12 ,
+    dbpa.termination_date,
+ 
+    dbpa.employment_status ,
+    dbpa.effective_begin_date ,
+    dbpa.BAD_ADDR_IND_CD ,
+    Plan_Analytics_Pension_Payment_Detail.PLAN_LDSC_TX,
+    CASE
+        WHEN UPPER(Plan_Analytics_Pension_Payment_Detail.PMT_TYPE) = 'ANNUITY' THEN 'Annuity'
+        WHEN UPPER(Plan_Analytics_Pension_Payment_Detail.PMT_TYPE) = 'LUMPSUM' THEN 'Lump Sum'
+        ELSE 'NA'
+    END,
+    Plan_Analytics_Pension_Payment_Detail.PMT_STAT_TX,
+    Plan_Analytics_Pension_Payment_Detail.PMT_LDSC_TX,
+    Plan_Analytics_Pension_Payment_Detail.BCD_DT,
+    Plan_Analytics_Pension_Payment_Detail.PMT_EFT_DT,
+    Plan_Analytics_Pension_Payment_Detail.DB_ELEC_LDSC_TX,
+    Plan_Analytics_Pension_Payment_Detail.SV_PRD_END_DT,
+    Plan_Analytics_Pension_Payment_Detail.OPFM_LDSC_TX,
+    Plan_Analytics_Pension_Payment_Detail.OPFM_GP_LDSC_TX,
+    Plan_Analytics_Pension_Payment_Detail.OPFM_CHG_DT,
+    Plan_Analytics_Pension_Payment_Detail.OPFM_END_DT,
+    Plan_Analytics_Pension_Payment_Detail.ATAX_CHG_DT,
+    Plan_Analytics_Pension_Payment_Detail.ATAX_END_DT,
+    Plan_Analytics_Pension_Payment_Detail.ELMN_SDSC_TX,
+    Plan_Analytics_Pension_Payment_Detail.PMT_ADJ_CD,
+    Plan_Analytics_Pension_Payment_Detail.PMT_ID,
+    Plan_Analytics_Pension_Payment_Detail.payment_destination,
+    Plan_Analytics_Pension_Payment_Detail.address_format_type_code,
+    addr.address_format_type_description,
+		addr.address_long_description,
+	Plan_Analytics_Pension_Payment_Detail.delivery_address_id
+)
+select * from main

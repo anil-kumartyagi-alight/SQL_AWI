@@ -1,0 +1,468 @@
+WITH hbal_dimn_dc AS (
+  SELECT
+    DISTINCT hardbalance_id hbal_id,
+    client_id,
+    fund_id,
+    plan_id,
+    --platform_id,
+    plan_long_description plan_ldsc_tx,
+    fund_long_description fund_ldsc_tx
+  FROM
+    wealth_rpt.hardbalance_dim
+  WHERE
+    plan_type_code = 'DC' and client_id =cast(<<$pClientId>> as int) 
+),
+	pcf
+AS (
+				select * from person_itg.person_custom_filter 
+				where client_id =cast(<<$pClientId>> as int) 
+				and data_product = 'DC'
+				and <<$pEndDate>> <= end_date
+				and <<$pEndDate>> >= begin_date
+				)	
+, fund_prices AS (
+  SELECT
+    client_id,
+    fund_id,
+    sum(case when effective_date = DATEADD(DAY, -1, <<$pBeginDate>>) then daily_price else 0 end) AS Fund_opening,
+	sum(case when effective_date = <<$pEndDate>> then daily_price else 0 end) AS Fund_closing
+  FROM
+    wealth_rpt.buysell_fund_prices
+  WHERE
+    client_id =cast(<<$pClientId>> as int)  and 
+	effective_date = DATEADD(DAY, -1, <<$pBeginDate>>) or effective_date = <<$pEndDate>>
+	group by client_id,fund_id 
+),
+balances_activity AS (
+  SELECT
+    fund.platform_person_internal_id, fund.client_id_string, fund.row_level_security_filter_value,
+	pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5,				
+    fund.plan_id,
+    fund.hard_balance_id as hbal_id,
+    sum(case when fund.begin_date <= <<$pEndDate>> AND fund.end_date >= <<$pEndDate>> then fund.closing_units end) AS CB_CLOSING,
+	sum(case when fund.begin_date <= <<$pBeginDate>> AND fund.end_date >= <<$pBeginDate>> then fund.closing_units end) AS OB_Closing,
+	sum(case when fund.begin_date <= <<$pBeginDate>> AND fund.end_date >= <<$pBeginDate>> then fund.opening_units end) AS OB_Opening,
+    fund.fund_id,
+    fund.client_id,
+    min(fund.begin_date) begin_date,
+    fund.platform_id
+  FROM
+    wealth_rpt.dc_hard_balance fund INNER join hbal_dimn_dc hbal_d on  
+	hbal_d.client_id = fund.client_id and 
+	--hbal_d.platform_id = fund.platform_id and
+	fund.plan_id = hbal_d.plan_id  and
+	fund.fund_id = hbal_d.fund_id and fund.hard_balance_id = hbal_d.hbal_id 
+	
+left join pcf on fund.platform_id = pcf.platform_id
+    and fund.platform_person_internal_id = pcf.platform_person_internal_id
+	and fund.client_id = pcf.client_id
+    and <<$pEndDate>> <= pcf.end_date
+    and <<$pEndDate>> >= pcf.begin_date
+
+	
+  WHERE 
+  fund.client_id =cast(<<$pClientId>> as int)  and
+  -- (closing_units + opening_units) <> 0 and
+    (fund.begin_date <= <<$pBeginDate>> AND fund.end_date >= <<$pBeginDate>>) or (fund.begin_date <= <<$pEndDate>> AND fund.end_date >= <<$pEndDate>>)
+group by 
+	
+	fund.platform_person_internal_id, fund.client_id_string, fund.row_level_security_filter_value,
+	pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5,				
+    fund.plan_id,
+    fund.hard_balance_id ,
+    fund.fund_id,
+    fund.client_id,
+    --fund.begin_date,
+    fund.platform_id	
+),
+attributes_dc AS (
+  SELECT
+    fund.client_id, fund.client_id_string, fund.row_level_security_filter_value,
+	pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5,				
+    fund.platform_person_internal_id,
+    fund.platform_id,
+    fund.plan_id,
+    fund.hard_balance_id AS hbal_id,
+    fund.fund_id,
+    SUM(fund.before_tax_amount) AS Payroll_Contributions_Before_Tax,
+    SUM(fund.after_tax_amount) AS Payroll_Contributions_After_Tax,
+    SUM(fund.roth_amount) AS Payroll_Contributions_Roth,
+    SUM(
+      fund.before_tax_amount + fund.after_tax_amount + fund.roth_amount
+    ) AS Total_Payroll_Contributions,
+    SUM(fund.employer_contribution_amount) AS employer_contribution_amount,
+    SUM(
+      fund.rollover_contribution_amount + fund.rollover_contribution_1_amount + fund.rollover_contribution_2_amount + fund.rollover_contribution_3_amount + fund.rollover_contribution_4_amount + fund.rollover_contribution_5_amount
+    ) AS rollover_contribution_amount,
+    SUM(fund.other_contribution_amount) AS Other_Contributions,
+    SUM(
+      fund.loan_payment_principal_amount + fund.dbp_loan_payment_amount + fund.loan_payment_3_amount + fund.loan_payment_4_amount + fund.loan_payment_5_amount + fund.loan_payment_interest_amount + fund.dbp_loan_payment_interest_amount + fund.loan_payment_interest_3_amount + fund.loan_payment_interest_4_amount + fund.loan_payment_interest_5_amount
+    ) AS Payroll_Loan_Payments,
+    SUM(
+      fund.manual_loan_payment_amount + fund.manual_loan_payment_interest_amount
+    ) AS Non_Payroll_Loan_Payments,
+    SUM(fund.new_loan_amount) AS New_Loan,
+    SUM(fund.disbursement_payment_amount) AS Disbursement,
+    SUM(fund.forfeiture_amount) AS Forfeiture,
+    SUM(fund.restored_forfieted_amounts) AS Restored_Forfeiture,
+    SUM(fund.distribution_amount) AS Buyback,
+    SUM(fund.transfer_amount) AS Transfers,
+    SUM(fund.converted_in_amount) AS Converted_In,
+    SUM(fund.converted_out_amount) AS Converted_Out,
+    SUM(fund.overage_in_amount) AS Overage_In,
+    SUM(fund.overage_out_amount) AS Overage_Out,
+    SUM(fund.roth_conversion_in_amount) AS Roth_Conversion_Input,
+    SUM(fund.roth_conversion_out_amount) AS Roth_Conversion_Output,
+    SUM(fund.other_account_amount) AS Other_Activities,
+    SUM(fund.applied_balance_amount) AS Gains_Losses,
+    SUM(fund.realized_earning_amount) AS Realized_Earnings,
+    SUM(fund.fee_expense_amount) AS Fees_Expenses,
+    SUM(fund.payments_amount) AS payments_amount
+  FROM
+    wealth_rpt.dc_hard_balance fund
+	INNER join hbal_dimn_dc hbal_d on  
+	hbal_d.client_id = fund.client_id and 
+	--hbal_d.platform_id = fund.platform_id and
+	fund.plan_id = hbal_d.plan_id  and
+	fund.fund_id = hbal_d.fund_id and fund.hard_balance_id = hbal_d.hbal_id 
+left join pcf on fund.platform_id = pcf.platform_id
+    and fund.platform_person_internal_id = pcf.platform_person_internal_id
+	and fund.client_id = pcf.client_id
+  --  and fund.begin_date <= pcf.end_date
+  --  and fund.end_date >= pcf.begin_date
+	
+  WHERE 
+  fund.client_id =cast(<<$pClientId>> as int)  and
+  -- (closing_units + opening_units) <> 0 and
+    fund.begin_date >= <<$pBeginDate>>
+    AND fund.begin_date <= <<$pEndDate>>
+  GROUP BY
+    fund.client_id, fund.client_id_string, fund.row_level_security_filter_value,
+	pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5,
+    fund.platform_person_internal_id,
+    fund.hard_balance_id,
+    fund.platform_id,
+    fund.plan_id,
+    fund.fund_id
+),
+aggregated_balances AS (
+  SELECT
+    ba.hbal_id,
+    ba.plan_id,
+    ba.fund_id,
+	ba.client_id_string, ba.row_level_security_filter_value,
+	ba.custom_filter_1, ba.custom_filter_2, ba.custom_filter_3, ba.custom_filter_4, ba.custom_filter_5,
+    SUM(
+      CASE
+        WHEN ba.begin_date = <<$pBeginDate>> THEN ba.OB_Opening * fpo.Fund_opening
+        ELSE ba.OB_Closing * fpo.Fund_opening
+      END
+    ) AS OB_Opening,
+    SUM(ba.OB_Closing * fpo.Fund_opening) AS OB_Closing,
+    SUM(ba.CB_CLOSING * fpo.Fund_closing) AS CB_Closing,
+    SUM(adc.Payroll_Contributions_Before_Tax) AS Payroll_Contributions_Before_Tax,
+    SUM(adc.Payroll_Contributions_After_Tax) AS Payroll_Contributions_After_Tax,
+    SUM(adc.Payroll_Contributions_Roth) AS Payroll_Contributions_Roth,
+    SUM(adc.Total_Payroll_Contributions) AS Total_Payroll_Contributions,
+    SUM(adc.employer_contribution_amount) AS employer_contribution_amount,
+    SUM(adc.rollover_contribution_amount) AS rollover_contribution_amount,
+    SUM(adc.Other_Contributions) AS Other_Contributions,
+    SUM(adc.New_Loan) AS New_Loan,
+    SUM(adc.Disbursement) AS Disbursement,
+    SUM(adc.Forfeiture) AS Forfeiture,
+    SUM(adc.Restored_Forfeiture) AS Restored_Forfeiture,
+    SUM(adc.Buyback) AS Buyback,
+    SUM(adc.Transfers) AS Transfers,
+    SUM(adc.Converted_In) AS Converted_In,
+    SUM(adc.Converted_Out) AS Converted_Out,
+    SUM(adc.Overage_In) AS Overage_In,
+    SUM(adc.Overage_Out) AS Overage_Out,
+    SUM(adc.Roth_Conversion_Input) AS Roth_Conversion_Input,
+    SUM(adc.Roth_Conversion_Output) AS Roth_Conversion_Output,
+    SUM(adc.Other_Activities) AS Other_Activities,
+    (
+      COALESCE(SUM(ba.CB_CLOSING * fpo.Fund_closing), 0) - COALESCE(
+        SUM(
+          CASE
+            WHEN ba.begin_date = <<$pBeginDate>> THEN ba.OB_Opening * fpo.Fund_opening
+            ELSE ba.OB_Closing * fpo.Fund_opening
+          END
+        ),
+        0
+      ) - COALESCE(SUM(adc.Gains_Losses), 0)
+    ) AS Gains_Losses,
+    SUM(adc.Payroll_Loan_Payments) AS Payroll_Loan_Payments,
+    SUM(adc.Non_Payroll_Loan_Payments) AS Non_Payroll_Loan_Payments,
+    SUM(adc.payments_amount) AS payments_amount,
+    SUM(adc.Realized_Earnings) AS Realized_Earnings,
+    SUM(adc.Fees_Expenses) AS Fees_Expenses
+  FROM
+    balances_activity ba
+    LEFT JOIN attributes_dc adc ON ba.client_id = adc.client_id and ba.hbal_id = adc.hbal_id
+    AND ba.platform_person_internal_id = adc.platform_person_internal_id
+	
+	and nvl(ba.custom_filter_1, '1') = nvl(adc.custom_filter_1, '1')
+  and nvl(ba.custom_filter_2, '1') = nvl(adc.custom_filter_2, '1')
+  and nvl(ba.custom_filter_3, '1') = nvl(adc.custom_filter_3, '1')
+  and nvl(ba.custom_filter_4, '1') = nvl(adc.custom_filter_4, '1')
+  and nvl(ba.custom_filter_5, '1') = nvl(adc.custom_filter_5, '1')
+	
+    LEFT JOIN fund_prices fpo ON ba.client_id = fpo.client_id
+    AND ba.fund_id = fpo.fund_id
+  GROUP BY
+    ba.client_id_string, ba.row_level_security_filter_value,
+	ba.plan_id,
+    ba.fund_id,
+    ba.hbal_id,
+	
+	ba.custom_filter_1, ba.custom_filter_2, ba.custom_filter_3, ba.custom_filter_4, ba.custom_filter_5
+)
+select
+  client_id,
+  client_id_string,
+  row_level_security_filter_value,
+  
+  custom_filter_1, custom_filter_2, custom_filter_3, custom_filter_4, custom_filter_5,
+  
+  sum(T.OB_Opening) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) opening_balance,
+  sum(T.CB_CLOSING) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) closing_balance,
+  sum(T.Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) forfeiture,
+  sum(Payroll_Contributions_Before_Tax) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) payroll_contributions_before_tax,
+  sum(Payroll_Contributions_After_Tax) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) payroll_contributions_after_tax,
+  sum(Payroll_Contributions_Roth) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) payroll_contributions_roth,
+  sum(Total_Payroll_Contributions) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) total_payroll_contributions,
+  sum(employer_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) employer_contribution_amount,
+  sum(rollover_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) rollover_contribution_amount,
+  sum(Other_Contributions) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) other_contributions,
+  sum(New_Loan) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) new_loan,
+  sum(Disbursement) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) disbursement,
+  sum(Restored_Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) restored_forfeiture,
+  sum(Buyback) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) buyback,
+  sum(Transfers) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) transfers,
+  sum(Converted_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) converted_in,
+  sum(Converted_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) converted_out,
+  sum(Overage_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) overage_in,
+  sum(Overage_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) overage_out,
+  sum(Roth_Conversion_Input) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) roth_conversion_input,
+  sum(Roth_Conversion_Output) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) roth_conversion_output,
+  sum(Other_Activities) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) other_activities,
+  sum(Gains_Losses) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) gains_losses,
+  sum(Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) payroll_loan_payments,
+  sum(Non_Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) non_payroll_loan_payments,
+  (
+    (
+      (
+        (
+          (
+            (
+              (
+                (
+                  (
+                    (
+                      (
+                        (
+                          (
+                            (
+                              (
+                                (
+                                  (
+                                    (
+                                      CASE
+                                        WHEN SUM(
+                                          (
+                                            Payroll_Contributions_Before_Tax + Payroll_Contributions_After_Tax
+                                          ) + Payroll_Contributions_Roth
+                                        ) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(
+                                          (
+                                            Payroll_Contributions_Before_Tax + Payroll_Contributions_After_Tax
+                                          ) + Payroll_Contributions_Roth
+                                        ) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                        ELSE 0.0
+                                      END + CASE
+                                        WHEN SUM(employer_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(employer_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                        ELSE 0.0
+                                      END
+                                    ) + CASE
+                                      WHEN SUM(rollover_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(rollover_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                      ELSE 0.0
+                                    END
+                                  ) + CASE
+                                    WHEN SUM(Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                    ELSE 0.0
+                                  END
+                                ) + CASE
+                                  WHEN SUM(Non_Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Non_Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                  ELSE 0.0
+                                END
+                              ) + CASE
+                                WHEN SUM(payments_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(payments_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                ELSE 0.0
+                              END
+                            ) + CASE
+                              WHEN SUM(New_Loan) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(New_Loan) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                              ELSE 0.0
+                            END
+                          ) + CASE
+                            WHEN SUM(Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                            ELSE 0.0
+                          END
+                        ) + CASE
+                          WHEN SUM(Restored_Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Restored_Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                          ELSE 0.0
+                        END
+                      ) + CASE
+                        WHEN SUM(Buyback) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Buyback) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                        ELSE 0.0
+                      END
+                    ) + CASE
+                      WHEN SUM(Transfers) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Transfers) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                      ELSE 0.0
+                    END
+                  ) + CASE
+                    WHEN SUM(Converted_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Converted_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                    ELSE 0.0
+                  END
+                ) + CASE
+                  WHEN SUM(Converted_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Converted_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                  ELSE 0.0
+                END
+              ) + CASE
+                WHEN SUM(Overage_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Overage_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                ELSE 0.0
+              END
+            ) + CASE
+              WHEN SUM(Overage_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Overage_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+              ELSE 0.0
+            END
+          ) + CASE
+            WHEN SUM(Roth_Conversion_Output) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Roth_Conversion_Output) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+            ELSE 0.0
+          END
+        ) + CASE
+          WHEN SUM(Roth_Conversion_Input) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Roth_Conversion_Input) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+          ELSE 0.0
+        END
+      ) + CASE
+        WHEN SUM(Other_Activities) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Other_Activities) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+        ELSE 0.0
+      END
+    ) + CASE
+      WHEN SUM(Realized_Earnings) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Realized_Earnings) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+      ELSE 0.0
+    END
+  ) + CASE
+    WHEN SUM(Fees_Expenses) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) > 0.0 THEN SUM(Fees_Expenses) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+    ELSE 0.0
+  END AS "net_inflows",
+  (
+    (
+      (
+        (
+          (
+            (
+              (
+                (
+                  (
+                    (
+                      (
+                        (
+                          (
+                            (
+                              (
+                                (
+                                  (
+                                    (
+                                      CASE
+                                        WHEN SUM(
+                                          (
+                                            Payroll_Contributions_Before_Tax + Payroll_Contributions_After_Tax
+                                          ) + Payroll_Contributions_Roth
+                                        ) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(
+                                          (
+                                            Payroll_Contributions_Before_Tax + Payroll_Contributions_After_Tax
+                                          ) + Payroll_Contributions_Roth
+                                        )over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                        ELSE 0.0
+                                      END + CASE
+                                        WHEN SUM(employer_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(employer_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                        ELSE 0.0
+                                      END
+                                    ) + CASE
+                                      WHEN SUM(rollover_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(rollover_contribution_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                      ELSE 0.0
+                                    END
+                                  ) + CASE
+                                    WHEN SUM(Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                    ELSE 0.0
+                                  END
+                                ) + CASE
+                                  WHEN SUM(Non_Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Non_Payroll_Loan_Payments) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                  ELSE 0.0
+                                END
+                              ) + CASE
+                                WHEN SUM(payments_amount)over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(payments_amount) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                                ELSE 0.0
+                              END
+                            ) + CASE
+                              WHEN SUM(New_Loan) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(New_Loan) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                              ELSE 0.0
+                            END
+                          ) + CASE
+                            WHEN SUM(Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)< 0.0 THEN SUM(Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                            ELSE 0.0
+                          END
+                        ) + CASE
+                          WHEN SUM(Restored_Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Restored_Forfeiture) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                          ELSE 0.0
+                        END
+                      ) + CASE
+                        WHEN SUM(Buyback) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Buyback) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                        ELSE 0.0
+                      END
+                    ) + CASE
+                      WHEN SUM(Transfers) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Transfers) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                      ELSE 0.0
+                    END
+                  ) + CASE
+                    WHEN SUM(Converted_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Converted_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                    ELSE 0.0
+                  END
+                ) + CASE
+                  WHEN SUM(Converted_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Converted_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                  ELSE 0.0
+                END
+              ) + CASE
+                WHEN SUM(Overage_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Overage_In) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+                ELSE 0.0
+              END
+            ) + CASE
+              WHEN SUM(Overage_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Overage_Out) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+              ELSE 0.0
+            END
+          ) + CASE
+            WHEN SUM(Roth_Conversion_Output) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Roth_Conversion_Output) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+            ELSE 0.0
+          END
+        ) + CASE
+          WHEN SUM(Roth_Conversion_Input) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Roth_Conversion_Input) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+          ELSE 0.0
+        END
+      ) + CASE
+        WHEN SUM(Other_Activities) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Other_Activities) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+        ELSE 0.0
+      END
+    ) + CASE
+      WHEN SUM(Realized_Earnings) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Realized_Earnings) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+      ELSE 0.0
+    END
+  ) + CASE
+    WHEN SUM(Fees_Expenses) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) < 0.0 THEN SUM(Fees_Expenses) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx)
+    ELSE 0.0
+  END AS "net_outflows",
+  sum(Realized_Earnings) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) realized_earnings,
+  sum(Fees_Expenses) over (partition by client_id, client_id_string, hbd.fund_ldsc_tx, hbd.plan_ldsc_tx) fees_expenses,
+  hbd.fund_ldsc_tx || '($)' as fund,
+  hbd.plan_ldsc_tx as plan_name
+FROM
+  aggregated_balances T
+  JOIN hbal_dimn_dc hbd ON T.hbal_id = hbd.hbal_id

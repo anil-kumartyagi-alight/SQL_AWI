@@ -1,0 +1,510 @@
+WITH mv_person
+AS (
+ SELECT DISTINCT global_client_id
+  ,global_person_id
+  ,client_id
+  ,client_id_string
+  ,platform_person_internal_id
+  ,platform_id
+  ,gender gender
+   ,CASE 
+WHEN birth_date IN (
+'1800-01-01'
+,'1900-01-01'
+,'1901-01-01'
+,'1910-01-01'
+,'1930-01-01'
+,'0001-12-30 BC'
+) THEN NULL
+ELSE birth_date end as birth_date
+  ,person_reason_code
+  ,is_bad_permanent_address
+  ,union_name
+  ,CASE WHEN upper(marital_status) like 'MARRIED%' THEN 'Y' ELSE 'N' end  as marital_status
+  ,last_name
+  ,middle_name
+  ,first_name
+  ,begin_date
+  ,end_date
+  
+ FROM person_rpt.person
+ WHERE
+   begin_date <= <<$pEndDate>>
+  AND end_date >= <<$pEndDate>>
+  AND client_id = cast(<<$pClientId>> as int)
+ )
+ ,
+psf AS (select * from person_itg.person_security_filter 
+			 where client_id =cast(<<$pClientId>> as int) 
+				
+),
+pcf AS (select * 
+        from person_itg.person_custom_filter 
+	    where client_id =cast(<<$pClientId>> as int) and data_product = 'DB'
+),
+
+mv_person_employment
+AS (
+ SELECT DISTINCT global_client_id
+  ,global_person_id
+  ,client_id
+  ,platform_person_internal_id
+  ,platform_id
+  ,cast (coalesce (expected_annual_base_salary,0)  as numeric (19,4))  as expected_annual_base_salary
+  ,hourly_salary_status
+  ,fulltime_parttime_status
+  ,standard_value AS employment_status
+  ,standard_employment_status as employment_status1
+  ,hire_date
+  --,termination_date
+  ,CASE WHEN  EXTRACT(YEAR FROM termination_date) < 1900 THEN NULL ELSE termination_date end as termination_date
+  ,employee_id
+  ,employment_status_begin_date
+ FROM person_rpt.person_employment employee
+ LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+		ON employee.standard_employment_status_code = rl.standard_key
+		AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+ WHERE begin_date <=  <<$pEndDate>>
+  AND end_date >=  <<$pEndDate>>
+  AND client_id  = cast(<<$pClientId>> as int)
+ )
+ ,person
+AS (
+ SELECT p.global_client_id
+  ,p.global_person_id
+  ,p.client_id
+  ,p.platform_id
+  ,p.client_id_string
+  ,p.platform_person_internal_id
+  ,e.expected_annual_base_salary as expected_annual_base_salary
+  ,e.hourly_salary_status
+  ,e.fulltime_parttime_status
+  ,e.employment_status1
+  ,p.person_reason_code
+  
+  ,p.union_name
+  ,p.gender
+  ,e.hire_date as hire_date
+  ,p.last_name
+  ,p.middle_name
+  ,p.first_name
+  ,p.is_bad_permanent_address
+  ,e.employee_id
+  ,p.birth_date
+  ,e.employment_status_begin_date
+  ,FLOOR(CASE 
+   WHEN p.birth_date IN (
+     '1800-01-01'
+     ,'1900-01-01'
+     ,'1901-01-01'
+     ,'1910-01-01'
+     ,'1930-01-01'
+     )
+    THEN NULL
+   ELSE ROUND(DATEDIFF(DAY, p.birth_date,  <<$pEndDate>>) / 365.25, 2)
+   END) AS age
+  ,CASE 
+   WHEN p.person_reason_code = 'Employee'
+     AND upper(e.employment_status) = 'ACTIVE'
+    THEN ROUND(DATEDIFF(DAY, e.hire_date,  <<$pEndDate>>) / 365.25, 2)
+   WHEN p.person_reason_code = 'Employee'
+    AND upper(e.employment_status) <> 'ACTIVE'
+    AND e.termination_date IS NOT NULL
+    AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+    THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+   ELSE NULL
+   END AS tenure,  p.marital_status,e.termination_date,
+   psf.row_level_security_filter_value,
+    pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5	
+ FROM mv_person p
+ left join psf on p.platform_id = psf.platform_id
+								and p.platform_person_internal_id = psf.platform_person_internal_id
+								and p.client_id = psf.client_id 				
+                
+left join pcf on p.platform_id = pcf.platform_id
+								and p.platform_person_internal_id = pcf.platform_person_internal_id
+								and p.client_id = pcf.client_id 
+								and <<$pEndDate>> <= pcf.end_date
+								and <<$pEndDate>> >= pcf.begin_date
+ 
+ LEFT JOIN mv_person_employment e ON p.client_id = e.client_id
+  AND p.platform_person_internal_id = e.platform_person_internal_id
+  AND p.platform_id = e.platform_id
+  --AND p.global_client_id = e.global_client_id
+ -- AND p.global_person_id = e.global_person_id
+  AND p.client_id  = cast(<<$pClientId>> as int)
+ )
+ 
+ ,
+ PRSN_PLANSTAT_DIMN01
+AS (
+ SELECT a.client_id AS CLIENT_ID
+ ,a.platform_id
+  ,a.platform_person_internal_id AS PRSN_INTN_ID
+  ,a.category_id AS CAT_ID
+  ,a.begin_date AS PP_STAT_EFBEG_DT
+  ,a.end_date AS PP_STAT_EFEND_DT
+  ,a.plan_status_code AS PLAN_STAT_CD
+  ,plan_status_description as plan_stat_tx
+  ,a.participation_status_code AS prtc_stat_cd
+  ,a.platform_indicator_code AS PLFM_IND_CD
+  ,a.plan_id AS PLAN_ID
+  ,c.plan_ldsc_tx as Plan_Description
+  ,b.category_type_code AS CAT_TYPE_CD
+  ,MAX(begin_date) OVER (
+   PARTITION BY a.client_id
+   ,a.plan_id
+   ,a.platform_person_internal_id
+   ,a.category_id
+   ) AS MAX_PP_STAT_EFBEG_DT
+ FROM wealth_rpt.person_planstatus_dim a
+ 
+ 
+
+ INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+  AND a.category_id = b.category_id
+  AND a.plan_id = b.plan_id
+ INNER JOIN wealth_rpt.db_plan_dim c on  a.client_id = c.client_id
+  AND a.plan_id = c.plan_id
+ WHERE
+  a.platform_indicator_code IN ('R3','R4','DBE') 
+  AND b.category_type_code = 'PS'
+  AND (<<$pEndDate>>) >= a.begin_date
+  AND (<<$pEndDate>>) <= a.end_date
+  AND b.category_definition_brand_code = 'DB-AVLB'
+  AND a.client_id  = cast(<<$pClientId>> as int)
+ )
+ ,PRSN_PLANSTAT_DIMN
+AS (
+ SELECT DISTINCT CLIENT_ID
+ ,platform_id
+  ,PLAN_ID
+  ,Plan_Description
+  ,CAT_ID
+  ,PRSN_INTN_ID
+  ,prtc_stat_cd
+  ,plfm_ind_cd
+  ,CAT_TYPE_CD
+  ,plan_stat_tx
+  ,MAX_PP_STAT_EFBEG_DT
+ FROM PRSN_PLANSTAT_DIMN01
+ WHERE MAX_PP_STAT_EFBEG_DT = PP_STAT_EFBEG_DT
+  AND CLIENT_ID NOT IN (1852)
+ )
+ ,person_planstat
+AS (
+ SELECT p.global_client_id
+  ,p.global_person_id
+  ,p.client_id
+  ,p.platform_id
+  ,p.client_id_string
+  ,p.birth_date
+  ,p.platform_person_internal_id
+  ,p.expected_annual_base_salary
+  ,p.hourly_salary_status
+  ,p.fulltime_parttime_status
+  ,p.person_reason_code
+  ,p.is_bad_permanent_address
+  ,p.union_name
+  ,p.gender
+  ,p.employment_status1
+  ,p.age
+  ,p.tenure
+  ,p.marital_status
+--  ,d.prtc_stat_cd
+--  ,d.plfm_ind_cd
+--  ,d.plan_id
+ -- ,d.Plan_Description
+  ,p.first_name
+  ,p.middle_name
+  ,p.last_name
+  ,p.employment_status_begin_date
+  ,p.employee_id
+  ,p.hire_date
+  ,p.termination_date
+  --,d.plan_stat_tx
+  ,p.row_level_security_filter_value,
+    p.custom_filter_1, p.custom_filter_2, p.custom_filter_3, p.custom_filter_4, p.custom_filter_5
+  
+ FROM person p
+-- prsn_planstat_dimn d
+-- right JOIN person p ON p.client_id = d.client_id
+--  AND p.platform_person_internal_id = d.prsn_intn_id
+--  AND p.platform_id = d.platform_id
+ --WHERE 
+ --d.plfm_ind_cd IN ('R3','R4','DBE') 
+  --AND
+  --UPPER(TRIM(p.employment_status)) = 'ACTIVE'
+  --AND UPPER(TRIM(prtc_stat_cd)) = 'ACTIVE'
+ )
+ ,person_data
+AS (
+ SELECT a.client_id, a.global_client_id, global_person_id
+ ,a.client_id_string
+ ,a.platform_id
+  ,a.platform_person_internal_id
+  ,a.expected_annual_base_salary AS salary
+  ,a.hourly_salary_status
+  ,a.fulltime_parttime_status
+  ,a.person_reason_code
+  ,a.union_name
+  ,a.is_bad_permanent_address
+  ,a.gender
+  ,a.employment_status_begin_date
+  ,a.first_name
+  ,a.middle_name
+  ,a.last_name
+  ,a.employee_id
+  ,a.birth_date
+  ,a.marital_status
+  ,a.employment_status1
+  ,(a.age) as age
+  ,(a.tenure) as tenure
+  ,a.hire_date
+ -- ,a.prtc_stat_cd
+ -- ,a.plfm_ind_cd
+--  ,a.plan_id
+--  ,a.Plan_Description
+--  ,a.plan_stat_tx
+  ,a.termination_date
+  , a.row_level_security_filter_value,
+    a.custom_filter_1, a.custom_filter_2, a.custom_filter_3, a.custom_filter_4, a.custom_filter_5
+ FROM person_planstat a
+ 
+ )
+ 
+ 
+ 
+ 
+ 
+ ,range_lookup
+AS (
+ SELECT standard_group_key
+  ,standard_display_name standard_display_value
+  ,standard_min
+  ,standard_max
+  ,OWNER
+ FROM adlfound_itg.standard_ranges_lookup
+ )
+ ,person_attributes
+AS (
+ SELECT a.global_client_id
+  ,a.global_person_id
+  ,a.client_id
+  ,a.platform_id
+  ,a.client_id_string
+  ,a.platform_person_internal_id
+  ,a.hourly_salary_status
+  ,a.fulltime_parttime_status
+  ,a.employment_status1
+  ,a.person_reason_code
+  ,a.union_name
+  ,a.gender
+  ,a.hire_date
+  ,a.last_name
+  ,a.middle_name
+  ,a.first_name
+  ,a.employee_id
+  ,a.birth_date
+  ,a.salary
+  ,a.age
+  ,a.marital_status
+  ,a.termination_date
+  ,a.employment_status_begin_date
+ -- ,a.prtc_stat_cd
+ -- ,a.plfm_ind_cd
+ -- ,a.plan_id
+ -- ,a.Plan_Description
+  ,a.tenure
+--  ,a.plan_stat_tx
+    ,b.standard_display_value AS AGE_RANGE
+  
+  
+  ,C.standard_display_value AS TENURE_RANGE
+  
+  ,D.standard_display_value AS SALARY_RANGE
+  , a.row_level_security_filter_value,
+    a.custom_filter_1, a.custom_filter_2, a.custom_filter_3, a.custom_filter_4, a.custom_filter_5
+  
+ FROM person_data a
+ LEFT JOIN (
+  SELECT *
+  FROM range_lookup
+  WHERE standard_group_key = 'AGE_RANGE_DB'
+  ) b ON floor(a.age) between b.standard_min AND b.standard_max
+ LEFT JOIN (
+  SELECT *
+  FROM range_lookup
+  WHERE standard_group_key = 'TENURE'
+  ) C ON floor(a.tenure) between C.standard_min AND C.standard_max
+ LEFT JOIN (
+  SELECT *
+  FROM range_lookup
+  WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+  ) D ON floor(a.salary) between D.standard_min AND D.standard_max 
+ ),
+ Exp_db_cmnct_fact_detail AS (
+    SELECT DISTINCT
+        platform_id AS platform_id,
+        client_id AS client_id,
+        platform_person_internal_id AS person_internal_id,
+		assumed_termination_date AS termination_date,
+  date( activity_initiated_cst_ts)AS Pension_Commencement_Event_Start_Date,
+  date( intent_retire_activity_completed_cst_ts) AS Pension_Commencement_Complete_Cancel_Expire_Date,
+     trim(commencement_status) AS event_status,
+  benefit_commencement_date,plan_id,
+  start_channel as Pesion_commencement_event_start_channel,
+ -- result_channel as Pension_Commencement_Complete_Cancel_Expire_Channel,
+ case 
+    when UPPER(result_channel) in ('W','U','WEB','UPOINT') then 'Web'
+    when UPPER(result_channel) in ('T','D','TELEPHONE REPRESENTATIVE','FORM','TELEPHONE REP.') then 'Call center'
+    when UPPER(result_channel) in ('B','BATCH') then 'System Initiated'
+  end as pension_commencement_complete_cancel_expire_channel,
+
+  cast(commencement_result_elapsed_days as varchar) as Pension_Commencement_Complete_Cancel_Expire_Elapsed_Time__Days
+    FROM wealth_rpt.db_commencement db_commencement_detail
+    WHERE client_id IN (cast(<<$pClientId>> as int)) 
+      AND date( activity_initiated_cst_ts) >= '1800-01-01'
+),
+
+Exp_cmnct_of_benefit_init_comm AS (
+SELECT DISTINCT 
+person_attributes.client_id as Client_ID,
+person_attributes.client_id_string, 
+person_attributes.platform_person_internal_id as platform_person_internal_id,
+person_attributes.platform_id,
+person_attributes.employee_id  as Employee_ID ,
+person_attributes.last_name as Last_Name ,
+person_attributes.first_name as First_Name ,
+person_attributes.middle_name as Middle_Name ,
+person_attributes.gender  as Gender ,
+person_attributes.birth_date as Birth_Date ,
+person_attributes.person_reason_code as Person_Type ,
+person_attributes.hire_date as Hire_Date,
+person_attributes.employment_status1  as Employment_Status ,
+person_attributes.age,
+person_attributes.salary,
+person_attributes.AGE_RANGE as Age_Range,
+person_attributes.SALARY_RANGE as Salary_Range,
+person_attributes.TENURE_RANGE as Employment_Range,
+person_attributes.fulltime_parttime_status as FullTime_PartTime,
+person_attributes.hourly_salary_status as Salary_Hourly,
+person_attributes.union_name as Union,
+person_attributes.marital_status as Spouse_On_File_Flag,
+Exp_db_cmnct_fact_detail.termination_date as Term_Date_Assumption,
+person_attributes.employment_status_begin_date as Employment_Status_Begin_Date ,
+  p.prtc_stat_cd
+  ,p.plfm_ind_cd
+  ,p.plan_id
+  ,p.Plan_Description
+  ,person_attributes.tenure AS Length_of_Employement
+  ,p.plan_stat_tx,
+  
+Exp_db_cmnct_fact_detail.Benefit_Commencement_Date,
+case when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('W','U','WEB','UPOINT') then 'Web'
+when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('T','D','TELEPHONE REPRESENTATIVE','FORM','TELEPHONE REP.') then 'Call center'
+when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('B','BATCH') then 'System Initiated'
+end as Pesion_commencement_event_start_channel,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Event_Start_Date,
+--'Initiated Commencement' AS Pension_commencement_status,
+'Initiated' AS Pension_commencement_status,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Complete_Cancel_Expire_Channel,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Complete_Cancel_Expire_Date,
+'NA' as Pension_Commencement_Complete_Cancel_Expire_Elapsed_Time__Days,
+person_attributes.row_level_security_filter_value,
+person_attributes.custom_filter_1, person_attributes.custom_filter_2, person_attributes.custom_filter_3, person_attributes.custom_filter_4, person_attributes.custom_filter_5
+FROM Exp_db_cmnct_fact_detail  inner join person_attributes person_attributes on 
+Exp_db_cmnct_fact_detail.person_internal_id=person_attributes.platform_person_internal_id
+and Exp_db_cmnct_fact_detail.client_id=person_attributes.client_id 
+and Exp_db_cmnct_fact_detail.platform_id=person_attributes.platform_id 
+--and Exp_db_cmnct_fact_detail.plan_id=person_attributes.plan_id 
+left join 
+PRSN_PLANSTAT_DIMN p  
+on
+Exp_db_cmnct_fact_detail.person_internal_id=p.prsn_intn_id
+and Exp_db_cmnct_fact_detail.client_id=p.client_id 
+and Exp_db_cmnct_fact_detail.platform_id=p.platform_id 
+and Exp_db_cmnct_fact_detail.plan_id=p.plan_id
+
+where
+DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', Pension_Commencement_Event_Start_Date)))
+between <<$pBeginDate>> and <<$pEndDate>>
+),
+
+Exp_cmnct_of_benefit_cplt_comm AS (
+
+SELECT DISTINCT 
+person_attributes.client_id as Client_ID,
+person_attributes.client_id_string, 
+person_attributes.platform_person_internal_id as platform_person_internal_id,
+person_attributes.platform_id,
+person_attributes.employee_id  as Employee_ID ,
+person_attributes.last_name as Last_Name ,
+person_attributes.first_name as First_Name ,
+person_attributes.middle_name as Middle_Name ,
+person_attributes.gender  as Gender ,
+person_attributes.birth_date as Birth_Date ,
+person_attributes.person_reason_code as Person_Type ,
+person_attributes.hire_date as Hire_Date,
+person_attributes.employment_status1  as Employment_Status ,
+person_attributes.age,
+person_attributes.salary,
+person_attributes.AGE_RANGE as Age_Range,
+person_attributes.SALARY_RANGE as Salary_Range,
+person_attributes.TENURE_RANGE as Employment_Range,
+person_attributes.fulltime_parttime_status as FullTime_PartTime,
+person_attributes.hourly_salary_status as Salary_Hourly,
+person_attributes.union_name as Union,
+person_attributes.marital_status as Spouse_On_File_Flag,
+Exp_db_cmnct_fact_detail.termination_date as Term_Date_Assumption,
+person_attributes.employment_status_begin_date as Employment_Status_Begin_Date ,
+  p.prtc_stat_cd
+  ,p.plfm_ind_cd
+  ,p.plan_id
+  ,p.Plan_Description
+  ,person_attributes.tenure AS Length_of_Employement
+  ,p.plan_stat_tx,
+Exp_db_cmnct_fact_detail.Benefit_Commencement_Date,
+case when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('W','U','WEB','UPOINT') then 'Web'
+when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('T','D','TELEPHONE REPRESENTATIVE','FORM','TELEPHONE REP.') then 'Call center'
+when UPPER(Exp_db_cmnct_fact_detail.Pesion_commencement_event_start_channel) in ('B','BATCH') then 'System Initiated'
+end as Pesion_commencement_event_start_channel,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Event_Start_Date,
+--Exp_db_cmnct_fact_detail.event_status AS Pension_commencement_status,
+CASE 
+            WHEN trim(event_status) = 'DB-ACEL' THEN 'Complete'
+            WHEN trim(event_status)= 'EXPI-ACEL' THEN 'Expire'
+            WHEN trim(event_status)= 'CNCL-RTRM' THEN 'Cancel'
+            ELSE 'Pending'
+        END AS Pension_commencement_status,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Complete_Cancel_Expire_Channel,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Complete_Cancel_Expire_Date,
+Exp_db_cmnct_fact_detail.Pension_Commencement_Complete_Cancel_Expire_Elapsed_Time__Days,
+person_attributes.row_level_security_filter_value,
+person_attributes.custom_filter_1, person_attributes.custom_filter_2, person_attributes.custom_filter_3, person_attributes.custom_filter_4, person_attributes.custom_filter_5
+
+FROM Exp_db_cmnct_fact_detail  inner join person_attributes person_attributes on Exp_db_cmnct_fact_detail.person_internal_id=person_attributes.platform_person_internal_id
+and Exp_db_cmnct_fact_detail.client_id=person_attributes.client_id
+and Exp_db_cmnct_fact_detail.platform_id=person_attributes.platform_id
+--and Exp_db_cmnct_fact_detail.plan_id=person_attributes.plan_id
+left join 
+PRSN_PLANSTAT_DIMN p  
+on
+Exp_db_cmnct_fact_detail.person_internal_id=p.prsn_intn_id
+and Exp_db_cmnct_fact_detail.client_id=p.client_id 
+and Exp_db_cmnct_fact_detail.platform_id=p.platform_id 
+and Exp_db_cmnct_fact_detail.plan_id=p.plan_id
+WHERE trim(event_status) in ('DB-ACEL','EXPI-ACEL', 'CNCL-RTRM') 
+and 
+DATEADD(day, -1, DATEADD(month, 1, DATE_TRUNC('month', Pension_Commencement_Complete_Cancel_Expire_Date)))
+between  <<$pBeginDate>> and <<$pEndDate>>
+),
+
+main as (
+
+select * from Exp_cmnct_of_benefit_init_comm
+union all
+select * from Exp_cmnct_of_benefit_cplt_comm
+) 
+
+select * from main

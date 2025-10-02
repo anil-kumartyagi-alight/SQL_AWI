@@ -1,0 +1,424 @@
+WITH mv_person
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,platform_id
+		,begin_date
+		,end_date
+		,platform_person_internal_id
+		,gender
+		,birth_date
+		,person_reason_code
+		,union_name
+		,last_name
+		,first_name
+		,middle_name
+		,is_bad_permanent_address
+	FROM person_rpt.person
+	WHERE person_reason_code = 'Employee'
+		AND begin_date <= (<<$pEndDate>>)
+		AND end_date >= (<<$pEndDate>>)
+		AND client_id = cast(<<$pClientId>> as int)
+	)
+	,mv_person_employment
+AS (
+	SELECT DISTINCT global_client_id
+		,global_person_id
+		,client_id
+		,platform_person_internal_id
+		,expected_annual_base_salary
+		,hourly_salary_status
+		,fulltime_parttime_status
+		,standard_employment_status as employment_status
+		,standard_value as employment_status1
+		,hire_date
+		,termination_date
+		,employee_id
+		,employment_status_begin_date
+		
+	FROM person_rpt.person_employment
+	left join (select distinct standard_key,standard_value from adlfound_itg.standard_rollups_lookup where
+standard_group_key in ('EMPL-STAT-CD-ROLLUP1') ) s
+on trim(standard_employment_status_code)=(standard_key)
+	WHERE 
+		 begin_date <= (<<$pEndDate>>)
+		AND end_date >= (<<$pEndDate>>)
+		AND client_id = cast(<<$pClientId>> as int)
+	)
+	, psf
+AS (
+				select * from person_itg.person_security_filter 
+				where client_id =cast(<<$pClientId>> as int) 
+
+				
+				)
+				, pcf
+AS (
+				select * from person_itg.person_custom_filter 
+				where client_id =cast(<<$pClientId>> as int) 
+				and data_product = 'DB'
+				)
+	,person
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+		,p.client_id
+        ,p.platform_id
+		,p.birth_date
+		,p.platform_person_internal_id
+		,e.expected_annual_base_salary
+		,e.hourly_salary_status
+		,e.fulltime_parttime_status
+		
+		,e.employment_status
+		,p.person_reason_code
+		,p.is_bad_permanent_address
+		,p.union_name
+		,p.gender
+		,e.employee_id
+		,e.employment_status_begin_date
+		,p.first_name
+		,p.middle_name
+		,p.last_name
+		,e.termination_date
+		,CASE 
+			WHEN p.birth_date IN (
+					'1800-01-01'
+					,'1900-01-01'
+					,'1901-01-01'
+					,'1910-01-01'
+					,'1930-01-01'
+					)
+				THEN NULL
+			ELSE ROUND(DATEDIFF(DAY, p.birth_date, (<<$pEndDate>>)) / 365.25, 2)
+			END AS age
+		,CASE 
+			WHEN p.person_reason_code = 'Employee'
+				AND upper(e.employment_status1) = 'ACTIVE'
+				THEN ROUND(DATEDIFF(DAY, e.hire_date, (<<$pEndDate>>)) / 365.25, 2)
+			WHEN p.person_reason_code = 'Employee'
+				AND upper(e.employment_status1) <> 'ACTIVE'
+				AND e.termination_date IS NOT NULL
+				AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+				THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+			ELSE NULL
+			END AS tenure,
+		psf.row_level_security_filter_value,
+		pcf.custom_filter_1, pcf.custom_filter_2, pcf.custom_filter_3, pcf.custom_filter_4, pcf.custom_filter_5
+	FROM mv_person p
+	LEFT JOIN mv_person_employment e ON p.client_id = e.client_id
+		AND p.platform_person_internal_id = e.platform_person_internal_id
+		--AND p.global_client_id = e.global_client_id
+	--	AND p.global_person_id = e.global_person_id
+		AND p.client_id = cast(<<$pClientId>> as int)
+	LEFT JOIN psf on p.platform_id = psf.platform_id
+		and p.platform_person_internal_id = psf.platform_person_internal_id
+		and p.client_id = psf.client_id 				
+                
+	LEFT JOIN pcf on p.platform_id = pcf.platform_id
+		and p.platform_person_internal_id = pcf.platform_person_internal_id
+		and p.client_id = pcf.client_id 
+		and <<$pEndDate>> <= pcf.end_date
+		and <<$pEndDate>> >= pcf.begin_date	
+	)
+	,PRSN_PLANSTAT_DIMN01
+AS (
+	SELECT a.client_id AS CLIENT_ID
+		,a.platform_person_internal_id AS PRSN_INTN_ID
+		,a.category_id AS CAT_ID
+		,a.begin_date AS PP_STAT_EFBEG_DT
+		,a.end_date AS PP_STAT_EFEND_DT
+		,a.plan_status_code AS PLAN_STAT_CD
+		,plan_status_description as plan_stat_tx
+		,a.participation_status_code AS prtc_stat_cd
+		,a.platform_indicator_code AS PLFM_IND_CD
+		,a.plan_id AS PLAN_ID
+		,b.category_type_code AS CAT_TYPE_CD
+		,MAX(begin_date) OVER (
+			PARTITION BY a.client_id
+			,a.plan_id
+			,a.platform_person_internal_id
+			,a.category_id
+			) AS MAX_PP_STAT_EFBEG_DT
+	FROM wealth_rpt.person_planstatus_dim a
+	INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+		AND a.category_id = b.category_id
+		AND a.plan_id = b.plan_id
+	WHERE
+		a.platform_indicator_code IN ('R3','R4','DBE') 
+		AND b.category_type_code = 'PS'
+		AND (<<$pEndDate>>) >= a.begin_date
+		AND (<<$pEndDate>>) <= a.end_date
+		AND b.category_definition_brand_code = 'PRTC-STAT'
+		AND a.client_id = cast(<<$pClientId>> as int)
+	)
+	,PRSN_PLANSTAT_DIMN
+AS (
+	SELECT DISTINCT CLIENT_ID
+		,PLAN_ID
+		,CAT_ID
+		,PRSN_INTN_ID
+		,prtc_stat_cd
+		,plfm_ind_cd
+		,CAT_TYPE_CD
+		,plan_stat_tx
+		,MAX_PP_STAT_EFBEG_DT
+	FROM PRSN_PLANSTAT_DIMN01
+	WHERE MAX_PP_STAT_EFBEG_DT = PP_STAT_EFBEG_DT
+		AND CLIENT_ID NOT IN (1852)
+	)
+	,person_planstat
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+		,p.client_id
+        ,p.platform_id
+		,p.birth_date
+		,p.platform_person_internal_id
+		,p.expected_annual_base_salary
+		,p.hourly_salary_status
+		,p.fulltime_parttime_status
+		,p.person_reason_code
+		,p.is_bad_permanent_address
+		,p.union_name
+		,p.gender
+		,p.employment_status
+		,p.age
+		,p.tenure
+		,d.prtc_stat_cd
+		,d.plfm_ind_cd
+		,d.plan_id
+		,p.first_name
+		,p.middle_name
+		,p.last_name
+		,p.employment_status_begin_date
+		,p.employee_id
+		,p.termination_date
+		,d.plan_stat_tx
+		,p.row_level_security_filter_value
+		,p.custom_filter_1
+		,p.custom_filter_2
+		,p.custom_filter_3
+		,p.custom_filter_4
+		,p.custom_filter_5
+	FROM prsn_planstat_dimn d
+	right JOIN person p ON p.client_id = d.client_id
+		AND p.platform_person_internal_id = d.prsn_intn_id
+	--WHERE 
+	--d.plfm_ind_cd IN ('R3','R4','DBE') 
+		--AND
+		--UPPER(TRIM(p.employment_status)) = 'ACTIVE'
+		--AND UPPER(TRIM(prtc_stat_cd)) = 'ACTIVE'
+	)
+	
+	,person_data
+AS (
+	SELECT a.client_id
+        ,a.platform_id
+		,a.platform_person_internal_id
+		,a.expected_annual_base_salary AS salary
+		,a.hourly_salary_status
+		,a.fulltime_parttime_status
+		,a.person_reason_code
+		,a.union_name
+		,a.is_bad_permanent_address
+		,a.gender
+		,a.employment_status_begin_date
+		,a.first_name
+		,a.middle_name
+		,a.last_name
+		,a.employee_id
+		,a.birth_date
+		,a.employment_status
+		,(a.age) as age
+		,(a.tenure) as tenure
+		,a.prtc_stat_cd
+		,a.plfm_ind_cd
+		,a.plan_id
+		,a.plan_stat_tx
+		,a.termination_date
+		,a.row_level_security_filter_value
+		,a.custom_filter_1
+		,a.custom_filter_2
+		,a.custom_filter_3
+		,a.custom_filter_4
+		,a.custom_filter_5
+	FROM person_planstat a
+	
+	)
+	,range_lookup
+AS (
+	SELECT standard_group_key
+		,standard_display_name
+		,standard_min
+		,standard_max
+		,OWNER
+	FROM adlfound_itg.standard_ranges_lookup
+	)
+	,dc_person_attributes
+AS (
+	SELECT a.client_id
+		,a.platform_id
+		,a.first_name
+		,a.middle_name
+		,a.last_name
+		,a.platform_person_internal_id
+		,a.hourly_salary_status
+		,a.fulltime_parttime_status
+		,a.person_reason_code
+		,a.union_name
+		,a.gender
+		,a.termination_date
+		,a.employment_status_begin_date
+		,a.employee_id
+		,a.is_bad_permanent_address
+		,a.employment_status
+		,a.prtc_stat_cd
+		,a.plfm_ind_cd
+		,a.plan_id
+		,a.birth_date
+		,a.plan_stat_tx
+		,a.age
+		,B.standard_display_name AS AGE_RANGE
+		,a.TENURE
+		,C.standard_display_name AS TENURE_RANGE
+		,a.salary
+		,D.standard_display_name AS SALARY_RANGE
+		,a.row_level_security_filter_value
+		,a.custom_filter_1
+		,a.custom_filter_2
+		,a.custom_filter_3
+		,a.custom_filter_4
+		,a.custom_filter_5
+		
+	FROM person_data a
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'AGE_RANGE_DB'
+		) b ON floor(a.age) between b.standard_min AND b.standard_max 
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'TENURE'
+		) C ON floor(a.tenure) between C.standard_min AND C.standard_max
+	LEFT JOIN (
+		SELECT *
+		FROM range_lookup
+		WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+		) D ON floor(a.salary) between D.standard_min AND D.standard_max
+	)
+, query_db_payments
+As (
+select client_id, payment_effective_date, plan_id, payment_destination,total_payment_amount,platform_person_internal_id,
+plan,
+payment_type,
+payment_status,
+payment_description,
+payment_id,
+payment_adjustment_cd,
+payment_instruction_begin_date,
+payment_instruction_end_date,
+payment_instruction_status_code,
+--db_person_plan.benefit_commencement_date,
+db_election,
+optional_form_group,
+optional_form,
+payment_element,
+start_amount,
+continued_start_amount,
+optional_form_change_date,
+change_amount,
+continued_change_amount,
+pop_up_amount,
+pop_up_change_amount,
+element_other_amount,
+optional_form_end_date,
+after_tax_amount,
+after_tax_change_date,
+after_tax_change_amount,
+after_tax_end_date,
+rollover_amount
+from wealth_rpt.db_payments where 
+client_id= cast(<<$pClientId>> as int) and 
+<<$pEndDate>> >= payment_instruction_begin_date and  <<$pBeginDate>> <=payment_instruction_end_date and payment_destination<>'NA'
+
+),
+
+main as (
+SELECT
+			dc_person_attributes.client_id,
+			dc_person_attributes.platform_id,
+			dc_person_attributes.platform_person_internal_id,
+			ltrim(to_char(dc_person_attributes.client_id,'99999')) as client_id_string, 
+			dc_person_attributes.employee_id,
+			dc_person_attributes.employment_status_begin_date,
+			dc_person_attributes.first_name,
+			dc_person_attributes.middle_name,
+			dc_person_attributes.last_name,
+			dc_person_attributes.is_bad_permanent_address,
+			dc_person_attributes.age,
+			dc_person_attributes.salary,
+			dc_person_attributes.birth_date,
+			dc_person_attributes.employment_status,
+			dc_person_attributes.person_reason_code as Person_type,
+			dc_person_attributes.hourly_salary_status,
+			dc_person_attributes.fulltime_parttime_status,
+			dc_person_attributes.union_name,
+			dc_person_attributes.gender,
+			dc_person_attributes.age_range,
+			dc_person_attributes.salary_range,
+			dc_person_attributes.tenure_range Length_of_Employment_Range,
+			dc_person_attributes.tenure as Length_of_Employment,
+			dc_person_attributes.termination_date,
+			case when query_db_payments.payment_destination='Drct_Dpst' then 'Direct Deposit'
+		when query_db_payments.payment_destination='Paper_Chk' then 'Paper Check' 
+		when query_db_payments.payment_destination='Rlvrs' then 'Rollovers'
+		when query_db_payments.payment_destination='Dflt_Rlvr' then 'Default Rollovers'
+		end as payment_destination,
+			query_db_payments.payment_type,
+			query_db_payments.plan_id,
+			query_db_payments.plan as Plan_name,
+			 query_db_payments.payment_effective_date,
+			 query_db_payments.total_payment_amount,
+			'' as Length_of_Service,
+			dc_person_attributes.plan_stat_tx as plan_status,
+			query_db_payments.payment_status,
+			query_db_payments.payment_description,
+			query_db_payments.payment_id ,
+			case when query_db_payments.payment_instruction_status_code='A' then 'Y' else 'N' end as In_payment,
+			--'' as benefit_commencement_date,
+			--'' as Age_at_Benefit_Commencement_Date,
+			payment_instruction_begin_date Payment_Begin_Date,
+			payment_instruction_end_date Payment_End_Date,
+			query_db_payments.db_election,
+			query_db_payments.optional_form_group,
+			query_db_payments.optional_form,
+			query_db_payments.payment_element,
+			query_db_payments.start_amount,
+			query_db_payments.continued_start_amount,
+			query_db_payments.optional_form_change_date as change_date,
+			query_db_payments.payment_adjustment_cd as Adjustment_Retro_Interest_Indicator,
+			query_db_payments.change_amount,
+			query_db_payments.continued_change_amount,
+			query_db_payments.pop_up_amount,
+			query_db_payments.pop_up_change_amount,
+			query_db_payments.element_other_amount,
+			query_db_payments.optional_form_end_date,
+			query_db_payments.after_tax_amount,
+			query_db_payments.after_tax_change_date,
+			query_db_payments.after_tax_change_amount,
+			query_db_payments.after_tax_end_date,
+			query_db_payments.rollover_amount,
+			dc_person_attributes.row_level_security_filter_value,
+			dc_person_attributes.custom_filter_1,
+			dc_person_attributes.custom_filter_2,
+			dc_person_attributes.custom_filter_3,
+			dc_person_attributes.custom_filter_4,
+			dc_person_attributes.custom_filter_5
+			from query_db_payments inner join dc_person_attributes  on
+				 query_db_payments.client_id = dc_person_attributes.client_id
+				 AND query_db_payments.platform_person_internal_id = dc_person_attributes.platform_person_internal_id)
+
+select * from main

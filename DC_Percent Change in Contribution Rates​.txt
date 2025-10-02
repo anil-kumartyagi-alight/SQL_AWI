@@ -1,0 +1,597 @@
+WITH mv_person
+AS (
+                SELECT DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id
+                                ,client_id_string
+                                ,platform_person_internal_id
+                                ,gender
+                                ,birth_date
+                                ,person_reason_code
+                                ,union_name
+                                ,platform_id
+                                ,CAST(last_day(add_months(current_date, -1)) AS DATE) as reporting_month
+						 
+										
+                FROM person_rpt.person
+                WHERE person_reason_code = 'Employee'
+                                AND begin_date <= last_day(add_months(current_date, -1))
+                                AND end_date >= last_day(add_months(current_date, -1))
+                                AND client_id =cast(<<$pClientId>> as int)
+                                                                UNION ALL
+                                                                SELECT DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id
+                                ,client_id_string
+                                ,platform_person_internal_id
+                                ,gender
+                                ,birth_date
+                                ,person_reason_code
+                                ,union_name
+                                 ,platform_id
+                                 ,CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE) as reporting_month
+						 
+										
+                FROM person_rpt.person
+                WHERE person_reason_code = 'Employee'
+                                AND begin_date <= CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE)
+                                AND end_date >= CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE)
+                                AND client_id =cast(<<$pClientId>> as int)
+                )
+                                                
+                ,mv_person_employment
+AS (
+                SELECT DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id
+                                ,platform_person_internal_id
+								,platform_id
+                                ,expected_annual_base_salary as salary
+                                ,expected_annual_base_salary_begin_date as salary_begin_date
+                                ,annual_payroll_frequency
+                                ,hourly_salary_status
+                                ,fulltime_parttime_status
+                                --,employment_status
+                                ,begin_date
+                                ,end_date
+                                ,hire_date
+                                ,termination_date
+                                ,standard_value AS employment_status
+                                ,standard_employment_status_code
+                                ,CAST(last_day(add_months(current_date, -1)) AS DATE) as reporting_month
+FROM person_rpt.person_employment pe
+LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+                ON pe.standard_employment_status_code = rl.standard_key
+                AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+                WHERE 
+                                begin_date <= last_day(add_months(current_date, -1))
+                                AND end_date >= last_day(add_months(current_date, -1))
+                                AND client_id =cast(<<$pClientId>> as int)
+                                UNION ALL
+                                SELECT DISTINCT global_client_id
+                                ,global_person_id
+                                ,client_id
+                                ,platform_person_internal_id
+								,platform_id
+                                ,expected_annual_base_salary as salary
+                                ,expected_annual_base_salary_begin_date as salary_begin_date
+                                ,annual_payroll_frequency
+                                ,hourly_salary_status
+                                ,fulltime_parttime_status
+                                --,employment_status
+                                ,begin_date
+                                ,end_date
+                                ,hire_date
+                                ,termination_date
+                                ,standard_value AS employment_status
+                                ,standard_employment_status_code
+                                ,CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE) as reporting_month
+FROM person_rpt.person_employment pe
+LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+                ON pe.standard_employment_status_code = rl.standard_key
+                AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+                WHERE 
+                                begin_date <= CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE)
+                                AND end_date >= CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE)
+                                AND client_id =cast(<<$pClientId>> as int)
+
+                )
+                                                ,
+psf
+AS (
+                SELECT *
+                FROM person_itg.person_security_filter
+                WHERE client_id = cast(cast(<<$pClientId>> as int) AS INT)
+                )
+
+                ,person
+AS (
+                SELECT p.global_client_id
+                                ,p.global_person_id
+                                ,p.client_id
+                                                                                                                                ,p.client_id_string
+                                                                                                                                ,p.platform_id
+                                ,p.platform_person_internal_id
+                                ,e.salary
+                                                                                                                                ,e.annual_payroll_frequency    
+                                                                                                                                ,e.salary_begin_date
+                                                                                                                                ,e.hourly_salary_status
+                                ,e.fulltime_parttime_status
+                                ,e.employment_status
+                                                                                                                                ,e.standard_employment_status_code
+                                ,p.person_reason_code
+                                ,p.union_name
+                                ,p.gender
+                                                                                                                                ,p.reporting_month
+                                ,FLOOR(CASE 
+                                                WHEN p.birth_date IN (
+                                                                                '1800-01-01'
+                                                                                ,'1900-01-01'
+                                                                                ,'1901-01-01'
+                                                                                ,'1910-01-01'
+                                                                                ,'1930-01-01'
+                                                                                )
+                                                                THEN NULL
+                                                ELSE ROUND(DATEDIFF(DAY, p.birth_date, last_day(add_months(current_date, -1))) / 365, 0)
+                                                END) AS age
+                                ,CASE 
+                                                WHEN p.person_reason_code = 'Employee'
+                                                                AND upper(e.employment_status) = 'ACTIVE'
+                                                                THEN ROUND(DATEDIFF(DAY, e.hire_date, last_day(add_months(current_date, -1))) / 365.25, 2)
+                                                WHEN p.person_reason_code = 'Employee'
+                                                                AND upper(e.employment_status) <> 'ACTIVE'
+                                                                AND e.termination_date IS NOT NULL
+                                                                AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+                                                                THEN ROUND(DATEDIFF(DAY, e.hire_date, e.termination_date) / 365.25, 2)
+                                                ELSE NULL
+                                                END AS tenure,
+                                                                                                                                                                                                psf.row_level_security_filter_value
+                FROM mv_person p
+                inner JOIN mv_person_employment e ON p.reporting_month=e.reporting_month
+                                AND p.client_id = e.client_id
+                                AND p.platform_person_internal_id = e.platform_person_internal_id
+								AND p.platform_id = e.platform_id
+                                --AND p.global_client_id = e.global_client_id
+                                --AND p.global_person_id = e.global_person_id
+                                AND p.client_id =cast(<<$pClientId>> as int)
+                                LEFT JOIN psf ON p.platform_id = psf.platform_id
+                                AND p.platform_person_internal_id = psf.platform_person_internal_id
+                                AND p.client_id = psf.client_id
+                                                                
+                ),
+prsn_planstat_dimn01
+AS (
+                SELECT a.client_id AS client_id
+                                ,a.platform_person_internal_id AS platform_person_internal_id
+                                ,a.category_id AS category_id
+                                ,a.begin_date AS begin_date
+                                ,a.end_date AS end_date
+                                ,a.plan_status_code AS plan_status_code
+                                ,a.participation_status_code AS participation_status_code
+                                ,a.platform_indicator_code AS platform_indicator_code
+                                ,a.plan_id AS plan_id
+                                ,CAST(last_day(add_months(current_date, -1)) AS DATE) as reporting_month
+                                ,b.category_type_code AS category_type_code
+                                ,MAX(begin_date) OVER (
+                                                PARTITION BY a.client_id
+                                                ,a.plan_id
+                                                ,a.platform_person_internal_id
+                                                ,a.category_id
+                                                ) AS max_begin_date
+                FROM wealth_rpt.person_planstatus_dim a
+                INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+                                AND a.category_id = b.category_id
+                                AND a.plan_id = b.plan_id
+                WHERE
+                                a.platform_indicator_code IN ('R3','R4','DCE') 
+                                AND b.category_type_code = 'PS'
+                                AND last_day(add_months(current_date, -1)) >= a.begin_date
+                                AND last_day(add_months(current_date, -1)) <= a.end_date
+                                AND b.category_definition_brand_code = 'PRTC-STAT'
+                                AND a.client_id =cast(<<$pClientId>> as int)
+                                UNION ALL
+                                SELECT a.client_id AS client_id
+                                ,a.platform_person_internal_id AS platform_person_internal_id
+                                ,a.category_id AS category_id
+                                ,a.begin_date AS begin_date
+                                ,a.end_date AS end_date
+                                ,a.plan_status_code AS plan_status_code
+                                ,a.participation_status_code AS participation_status_code
+                                ,a.platform_indicator_code AS platform_indicator_code
+                                ,a.plan_id AS plan_id
+                                ,CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE) as reporting_month
+                                ,b.category_type_code AS category_type_code
+                                ,MAX(begin_date) OVER (
+                                                PARTITION BY a.client_id
+                                                ,a.plan_id
+                                                ,a.platform_person_internal_id
+                                                ,a.category_id
+                                                ) AS max_begin_date
+                FROM wealth_rpt.person_planstatus_dim a
+                INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+                                AND a.category_id = b.category_id
+                                AND a.plan_id = b.plan_id
+                WHERE
+                                a.platform_indicator_code IN ('R3','R4','DCE') 
+                                AND b.category_type_code = 'PS'
+                                AND CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE) >= a.begin_date
+                                AND CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE) <= a.end_date
+                                AND b.category_definition_brand_code = 'PRTC-STAT'
+                                AND a.client_id =cast(<<$pClientId>> as int)
+                )
+                ,prsn_planstat_dimn
+AS (
+                SELECT DISTINCT client_id
+                                ,plan_id
+                                ,category_id
+                                ,platform_person_internal_id
+                                ,participation_status_code
+                                ,platform_indicator_code
+                                ,max_begin_date
+                                ,reporting_month
+                FROM prsn_planstat_dimn01
+                WHERE max_begin_date = begin_date
+                --and upper(trim(participation_status_code)) in  ('ACTIVE','ELIG')
+                )
+,person_data 
+AS (
+                SELECT p.global_client_id
+                                ,p.global_person_id
+                                ,p.client_id
+                                ,p.client_id_string
+                                ,p.row_level_security_filter_value
+                                ,p.platform_person_internal_id
+                                ,p.salary
+                                ,p.annual_payroll_frequency
+                                ,p.salary_begin_date
+                                ,p.hourly_salary_status
+                                ,p.fulltime_parttime_status
+                                ,p.person_reason_code
+                                ,p.union_name
+                                ,p.gender
+                                ,p.employment_status
+                                ,p.standard_employment_status_code
+                                ,p.age
+                                ,p.tenure
+                                ,d.participation_status_code
+                                ,d.platform_indicator_code
+                                ,d.plan_id
+                                ,p.reporting_month
+                FROM prsn_planstat_dimn d
+                INNER JOIN person p ON 
+                TO_CHAR(p.reporting_month, 'YYYY-MM-DD') = TO_CHAR(d.reporting_month, 'YYYY-MM-DD') 
+                and
+                p.client_id = d.client_id
+                                AND p.platform_person_internal_id = d.platform_person_internal_id
+                )
+                ,range_lookup
+AS (
+                SELECT standard_group_key
+                                ,standard_display_name
+                                ,standard_min
+                                ,standard_max
+                                ,OWNER
+                FROM adlfound_itg.standard_ranges_lookup
+                )
+                ,dc_person_attributes
+AS (
+                SELECT a.client_id
+                                                                ,a.client_id_string
+                                        ,a.row_level_security_filter_value
+                                ,a.platform_person_internal_id
+                                ,a.hourly_salary_status
+                                ,a.fulltime_parttime_status
+                                ,a.person_reason_code
+                                ,a.union_name
+                                ,a.gender
+                                                                                                                                ,a.plan_id
+                                ,a.employment_status
+                                                                                                                                ,a.participation_status_code
+                                                                                                                                ,a.standard_employment_status_code
+                                ,a.age
+                                ,B.standard_display_name AS AGE_RANGE
+                                ,a.TENURE
+                                ,C.standard_display_name AS TENURE_RANGE
+                                ,a.salary
+                                                                                                                                ,a.annual_payroll_frequency
+                                                                                                                                ,a.salary_begin_date
+                                ,D.standard_display_name AS SALARY_RANGE
+                                                                                                                                ,a.reporting_month
+                FROM person_data a
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'AGE_RANGE_DC'
+                                ) b ON FLOOR (a.age) between (b.standard_min)AND (b.standard_max)
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'TENURE'
+                                ) C ON FLOOR (a.tenure) between (C.standard_min) AND (C.standard_max)
+                LEFT JOIN (
+                                SELECT *
+                                FROM range_lookup
+                                WHERE standard_group_key = 'SALARY_RANGE_WEALTH'
+                                ) D ON FLOOR (a.salary) between (D.standard_min) AND (D.standard_max)
+                ),
+dc_contributions_ppts AS (
+SELECT 
+ client_id, 
+ plan_id, 
+ platform_person_internal_id, 
+ contribution_rate_id,
+begin_date,
+actual_contribution_rate,
+actual_contribution_amount,
+ROW_NUMBER() OVER (
+PARTITION BY client_id, plan_id, platform_person_internal_id, contribution_rate_id 
+ ORDER BY begin_date DESC
+) AS rn,
+CAST(last_day(add_months(current_date, -1)) AS DATE) as reporting_month
+FROM wealth_itg.dc_contributions
+WHERE client_id = cast(<<$pClientId>> as int)
+AND last_day(add_months(current_date, -1)) BETWEEN begin_date AND end_date
+AND contribution_rate_type_code IN ('AT', 'BT', 'RT')
+UNION ALL
+SELECT 
+ client_id, 
+ plan_id, 
+ platform_person_internal_id, 
+ contribution_rate_id,
+begin_date,
+actual_contribution_rate,
+actual_contribution_amount,
+ROW_NUMBER() OVER (
+PARTITION BY client_id, plan_id, platform_person_internal_id, contribution_rate_id 
+ ORDER BY begin_date DESC
+) AS rn,
+CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE) AS reporting_month
+FROM wealth_itg.dc_contributions
+WHERE client_id = cast(<<$pClientId>> as int) AND
+CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE) between begin_date and end_date
+AND contribution_rate_type_code IN ('AT', 'BT', 'RT')
+),
+dc_contributions_filter AS ( 
+select reporting_month,client_id, plan_id, platform_person_internal_id, contribution_rate_id,
+sum(actual_contribution_rate) as actual_contribution_rate,
+sum(actual_contribution_amount) as actual_contribution_amount
+from dc_contributions_ppts    
+WHERE rn = 1
+group by reporting_month,client_id, plan_id, platform_person_internal_id,contribution_rate_id
+),
+dc_ccp_ctrb_id AS (
+SELECT c.client_id,c.base_provision_type_id,CAST(c.provision_key_value AS INT) as provision_key_value,ci.base_element_id, ROW_NUMBER() OVER(PARTITION BY c.client_id ) as rn
+FROM adlfound_itg.ccr_instance c 
+inner join 
+adlfound_itg.ccr_instance_element ci
+on c.client_id=ci.client_id
+and c.data_instance_id=ci.data_instance_id
+where c.client_id=cast(<<$pClientId>> as int) 
+  and ci.base_element_id in (106580,106570,106560)
+  and trim(c.platform_indicator_code) in ('R3','R4','DCE')
+),
+dc_ccp_ctrb_id_uniq_client AS (
+select client_id from dc_ccp_ctrb_id 
+where rn=1
+),
+--Use contribution id available in ccp table. If ccp data doesn't exist, use contributions directly from contribution table.
+dc_contributions_ccp AS (
+(SELECT c.*
+FROM dc_contributions_filter c
+INNER JOIN dc_ccp_ctrb_id d_ccp
+ON c.client_id=d_ccp.client_id
+AND c.contribution_rate_id=d_ccp.provision_key_value
+)
+UNION ALL
+(SELECT c.*
+FROM dc_contributions_filter c
+WHERE NOT EXISTS (
+SELECT 1 FROM dc_ccp_ctrb_id_uniq_client i WHERE i.client_id = c.client_id
+))
+),
+dc_contributions AS (
+select reporting_month,client_id, plan_id, platform_person_internal_id,
+sum(actual_contribution_rate) as actual_contribution_rate,
+sum(actual_contribution_amount) as actual_contribution_amount
+from dc_contributions_ccp    
+--WHERE rn = 1
+group by reporting_month,client_id, plan_id, platform_person_internal_id
+),
+dc_balances as (
+SELECT client_id
+,plan_id
+                                ,platform_person_internal_id
+                                ,CAST(last_day(add_months(current_date, -1)) AS DATE) as reporting_month
+                                ,sum(closing_balance_amount) as plan_balance
+                                
+                FROM wealth_rpt.dc_account_balances
+                where client_id=cast(<<$pClientId>> as int)  AND effective_date = last_day(add_months(current_date, -1)) AND closing_balance_amount >0                
+                group by client_id, plan_id, platform_person_internal_id                          
+                UNION ALL
+                SELECT client_id
+,plan_id
+                                ,platform_person_internal_id
+                                ,CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE) AS reporting_month
+                                ,sum(closing_balance_amount) as plan_balance
+                                
+                FROM wealth_rpt.dc_account_balances
+                where client_id=cast(<<$pClientId>> as int)  AND effective_date = CAST(DATEADD(day, -1, DATE_TRUNC('month', CAST(add_months(current_date, -1) AS DATE))) AS DATE)
+                AND closing_balance_amount >0         
+                group by client_id, plan_id, platform_person_internal_id                          
+),
+dc_ctrb_bal AS (
+select pa.reporting_month, pa.client_id,pa.client_id_string
+                                ,pa.row_level_security_filter_value, pa.plan_id, pa.platform_person_internal_id, pa.participation_status_code,pa.employment_status,pa.standard_employment_status_code,
+CASE 
+ WHEN (dc.actual_contribution_rate = 0 OR dc.actual_contribution_rate IS NULL) 
+ AND dc.actual_contribution_amount > 0 THEN 
+ CASE 
+													
+	  
+ WHEN pa.salary_begin_date <= last_day(add_months(current_date, -1)) THEN
+CASE 
+ WHEN (pa.salary IS NULL OR pa.salary = 0) 
+ OR (pa.annual_payroll_frequency IS NULL OR pa.annual_payroll_frequency = 0) THEN 0
+ELSE ROUND(
+            (dc.actual_contribution_amount::DECIMAL(18,6) / 
+             (pa.salary::DECIMAL(18,6) / pa.annual_payroll_frequency::DECIMAL(18,6))) * 100, 6)
+END
+ELSE 0
+END
+ELSE dc.actual_contribution_rate
+END AS actual_contribution_rate,
+
+dc.actual_contribution_amount, bal.plan_balance
+from dc_person_attributes pa
+left join dc_contributions dc
+on           TO_CHAR(pa.reporting_month, 'YYYY-MM-DD') = TO_CHAR(dc.reporting_month, 'YYYY-MM-DD')
+and pa.client_id=dc.client_id
+and pa.plan_id=dc.plan_id
+and pa.platform_person_internal_id=dc.platform_person_internal_id
+left join dc_balances bal
+on           TO_CHAR(pa.reporting_month, 'YYYY-MM-DD') = TO_CHAR(bal.reporting_month, 'YYYY-MM-DD')
+and pa.client_id=bal.client_id
+and pa.plan_id=bal.plan_id
+and pa.platform_person_internal_id=bal.platform_person_internal_id
+),
+
+
+dc_ctrb AS (
+select reporting_month, client_id,client_id_string
+                                ,row_level_security_filter_value,
+plan_id, platform_person_internal_id, participation_status_code,standard_employment_status_code, actual_contribution_rate, actual_contribution_amount,employment_status,plan_balance,
+CASE 
+ WHEN NVL(LAG(NVL(actual_contribution_rate, 0)) 
+ OVER (PARTITION BY client_id, platform_person_internal_id, plan_id 
+ ORDER BY reporting_month ASC), 0) = 0
+AND NVL(actual_contribution_rate, 0) > 0 
+ THEN 'Started'
+ELSE 'NA'
+END AS contribution_rate_change_flag,
+
+NVL(actual_contribution_rate, 0) - 
+NVL(LAG(NVL(actual_contribution_rate, 0)) 
+ OVER (PARTITION BY client_id, platform_person_internal_id, plan_id 
+ ORDER BY reporting_month ASC), 0) AS contribution_rate_change,
+case when upper(trim(participation_status_code))='ELIG' and (nvl(actual_contribution_rate,0) > 0 or nvl(actual_contribution_amount,0) >0) then 'Eligible - Contributing'
+                                when upper(trim(participation_status_code))='ELIG' and (nvl(actual_contribution_rate,0) <= 0 and nvl(actual_contribution_amount,0) <= 0) and nvl(plan_balance,0) <= 0 then 'Eligible - Not Contributing'
+                                when upper(trim(participation_status_code))='ACTIVE' and (nvl(actual_contribution_rate,0) > 0 or nvl(actual_contribution_amount,0) >0) then 'Active - Contributing'
+                                when upper(trim(participation_status_code))='ACTIVE' and (nvl(actual_contribution_rate,0) <= 0 and nvl(actual_contribution_amount,0) <= 0) then 'Active - Not Contributing'
+                                when upper(trim(participation_status_code))='ELIG' and (nvl(actual_contribution_rate,0) <=0 and nvl(actual_contribution_amount,0) <= 0) and nvl(plan_balance,0) > 0  then 'Eligible - Not Contributing w/ Balance' 
+                                when upper(trim(standard_employment_status_code)) IN ('LOFF','RTEE','SVRN_PAY','TERM','DCSD_OUT_OF_SV','DCSD_INSV_BC_CALL','DCSD_INSV_HR_FEED') and nvl(plan_balance,0) >0 then 'Terminated with Balance'
+                                else 'Others'
+                                end AS participation_status,
+lag(employment_status) over(partition by client_id, platform_person_internal_id,plan_id order by reporting_month asc) as employment_status_prev,
+lag(participation_status_code) over(partition by client_id, platform_person_internal_id,plan_id order by reporting_month asc) as participation_status_code_prev,
+lag(plan_balance) over(partition by client_id, platform_person_internal_id,plan_id order by reporting_month asc) as plan_balance_prev,
+lag(actual_contribution_rate) over(partition by client_id, platform_person_internal_id,plan_id order by reporting_month asc) as actual_contribution_rate_prev
+
+from dc_ctrb_bal
+),
+
+dc_contribution_all AS (
+select reporting_month, client_id,client_id_string
+                                ,row_level_security_filter_value ,plan_id, platform_person_internal_id, participation_status_code,standard_employment_status_code, actual_contribution_rate, actual_contribution_amount,employment_status,participation_status, employment_status_prev,plan_balance,
+participation_status_code_prev,plan_balance_prev,actual_contribution_rate_prev,
+case when 
+ upper(trim(employment_status_prev))='ACTIVE' and upper(trim(employment_status))='ACTIVE' and  upper(trim(participation_status_code_prev))='ACTIVE' and
+upper(trim(participation_status_code)) in ('ACTIVE','ELIG' ) and plan_balance_prev > 0 and actual_contribution_rate_prev>0  then 
+(actual_contribution_rate  - actual_contribution_rate_prev)
+else 0 end
+AS contribution_rate_change,
+case
+when 
+actual_contribution_rate_prev=0 and actual_contribution_rate>0 and  upper(trim(employment_status))='ACTIVE' and  upper(trim(participation_status_code_prev)) not in ('ACTIVE') 
+and upper(trim(participation_status_code)) in ('ACTIVE','ELIG' )  and  plan_balance > 0 then 'Started' 
+when nvl(contribution_rate_change,0) > 0 and upper(trim(employment_status_prev))='ACTIVE' and upper(trim(employment_status))='ACTIVE' and 
+ actual_contribution_rate_prev > 0 and upper(trim(participation_status_code_prev))='ACTIVE' and upper(trim(participation_status_code)) in ('ACTIVE','ELIG' ) and plan_balance_prev > 0  then 'Increased'
+when nvl(contribution_rate_change,0) < 0 and nvl(actual_contribution_rate,0)=0 
+and upper(trim(employment_status_prev))='ACTIVE' and upper(trim(employment_status))='ACTIVE' and  upper(trim(participation_status_code_prev))='ACTIVE' and 
+upper(trim(participation_status_code)) in ('ACTIVE','ELIG' ) and plan_balance_prev > 0 then 'Decreased and Stopped'
+when nvl(contribution_rate_change,0) < 0 and nvl(actual_contribution_rate,0)>0 and upper(trim(employment_status_prev))='ACTIVE' and 
+upper(trim(employment_status))='ACTIVE' and  upper(trim(participation_status_code_prev))='ACTIVE' and upper(trim(participation_status_code)) in ('ACTIVE','ELIG' ) and plan_balance_prev > 0  then 'Decreased not Stopped'
+when nvl(contribution_rate_change,0) = 0 and upper(trim(employment_status_prev))='ACTIVE' and upper(trim(employment_status))='ACTIVE' and  
+upper(trim(participation_status_code_prev))='ACTIVE' and upper(trim(participation_status_code)) in ('ACTIVE','ELIG' ) and plan_balance_prev > 0 and actual_contribution_rate_prev > 0 then 'Equal'
+else 'NA'
+end AS contribution_rate_change_flag
+
+
+from dc_ctrb
+where reporting_month = last_day(add_months(current_date, -1))
+),
+
+dc_contributions_final AS  (
+select client_id,client_id_string
+                                ,row_level_security_filter_value, plan_id, platform_person_internal_id, participation_status_code, participation_status,contribution_rate_change_flag,
+case when actual_contribution_rate>0 or actual_contribution_amount > 0 then 1 else 0 end AS ppt_cbtr_flg,contribution_rate_change
+from dc_contribution_all
+where ((upper(trim(employment_status))='ACTIVE' AND upper(trim(participation_status_code)) in ('ACTIVE','ELIG')) OR 
+(upper(trim(participation_status))='TERMINATED WITH BALANCE'))
+),
+dc_contribution_aggregate AS (
+select client_id,client_id_string
+                                ,row_level_security_filter_value, participation_status,contribution_rate_change_flag,
+sum(ppt_cbtr_flg) as contributing_participants,
+sum(contribution_rate_change) as contribution_rate_change,
+COUNT(distinct platform_person_internal_id) as total_participants
+from dc_contributions_final
+group by client_id, participation_status,contribution_rate_change_flag,client_id_string
+                                ,row_level_security_filter_value
+),
+dc_contribution_plan_aggregate AS (
+select client_id,client_id_string
+                                ,row_level_security_filter_value, 
+
+SUM(
+            CASE 
+                WHEN contribution_rate_change_flag = 'Increased' THEN contributing_participants
+            END) AS increased_contribution_ppts,
+SUM(
+            CASE 
+                WHEN contribution_rate_change_flag = 'Increased' THEN contribution_rate_change
+            END) AS increased_contribution,
+SUM(
+            CASE 
+                WHEN 
+                    contribution_rate_change_flag IN ( 
+                        'Decreased not Stopped'
+                         )
+                    THEN
+                        contributing_participants
+            END) AS decreased_contribution_ppts,
+SUM(
+            CASE 
+                WHEN 
+                    contribution_rate_change_flag IN ( 
+                        'Decreased not Stopped'
+                         )
+                    THEN
+                        contribution_rate_change
+            END) AS decreased_contribution,
+SUM(      CASE 
+                WHEN 
+                    participation_status <> 'Terminated with Balance'
+                    THEN
+                        contributing_participants
+            END) AS contributing_participants
+from dc_contribution_aggregate
+where participation_status <> 'Terminated with Balance'
+group by client_id,client_id_string,row_level_security_filter_value
+)
+/*dc_metric AS (
+select ctrb.client_id, 
+Round(abs(ctrb.decreased_contribution)::DECIMAL/nullif(ctrb.decreased_contribution_ppts,0),1) as average_decrease,
+Round(ctrb.increased_contribution::DECIMAL/nullif(ctrb.increased_contribution_ppts,0),1) as average_increase
+from dc_contribution_plan_aggregate ctrb*/
+
+--select * from dc_metric
+
+select ctrb.client_id,client_id_string,row_level_security_filter_value,'Average Decrease' as Threshold_Type,
+abs(ctrb.decreased_contribution) as average_contribution_Numerator
+,nullif(ctrb.decreased_contribution_ppts,0) as average_contribution_Denominator
+from dc_contribution_plan_aggregate ctrb
+union
+select ctrb.client_id,client_id_string,row_level_security_filter_value,'Average Increase' as Threshold_Type,
+ctrb.increased_contribution as average_contribution_Numerator
+,nullif(ctrb.increased_contribution_ppts,0) as average_contribution_Denominator
+from dc_contribution_plan_aggregate ctrb

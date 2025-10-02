@@ -1,0 +1,214 @@
+--begin_date = '2024-12-01'
+--end_date = '2024-12-31'
+
+WITH calendar 
+AS(
+	SELECT DISTINCT 
+		previous_month_begin_date as cal_begin_date
+		,previous_month_end_date as cal_end_date
+	FROM adlfound_itg.calendar 
+	WHERE previous_month_end_date BETWEEN CAST(DATE_TRUNC('MONTH',ADD_MONTHS(CURRENT_DATE,-13)) AS DATE) AND CAST(LAST_DAY(ADD_MONTHS(CURRENT_DATE,-1)) AS DATE) 
+	)
+	,psf 
+AS (
+	select * from person_itg.person_security_filter 
+			 where client_id =cast(<<$pClientId>> as int) 				
+)
+	,mv_person_employment
+AS (
+	SELECT DISTINCT pe.global_client_id
+		,pe.global_person_id
+		,pe.client_id
+		,pe.client_id_string
+		,pe.platform_person_internal_id
+		,expected_annual_base_salary
+		,hourly_salary_status
+		,fulltime_parttime_status
+		--,employment_status
+		,begin_date
+		,end_date
+		,hire_date
+		,termination_date
+		,pe.platform_id
+		,standard_value AS employment_status
+		,row_level_security_filter_value
+		,cal_end_date
+FROM person_rpt.person_employment pe
+CROSS JOIN calendar
+LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup rl
+	ON pe.standard_employment_status_code = rl.standard_key
+	AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+left join psf on pe.platform_id = psf.platform_id
+		and pe.platform_person_internal_id = psf.platform_person_internal_id
+		and pe.client_id = psf.client_id 
+	WHERE 
+		begin_date <= cal_end_date
+		AND end_date >= cal_end_date
+		AND pe.client_id =<<$pClientId>>
+		AND UPPER(TRIM(standard_value)) = 'ACTIVE'
+	)
+	,PRSN_PLANSTAT_DIMN01
+AS (
+	SELECT a.client_id AS CLIENT_ID
+		,a.platform_person_internal_id AS PRSN_INTN_ID
+		,a.platform_id
+		,a.begin_date AS PP_STAT_EFBEG_DT
+		,a.plan_status_code AS PLAN_STAT_CD
+		,a.participation_status_code AS prtc_stat_cd
+		,a.plan_id AS PLAN_ID
+		,cal_end_date
+		,MAX(begin_date) OVER (
+			PARTITION BY a.client_id
+			,a.plan_id
+			,a.platform_person_internal_id
+			,a.category_id
+			,cal_end_date
+			) AS MAX_PP_STAT_EFBEG_DT
+	FROM wealth_rpt.person_planstatus_dim a
+	CROSS JOIN calendar
+	INNER JOIN wealth_rpt.dc_category_dim b ON a.client_id = b.client_id
+		AND a.category_id = b.category_id
+		AND a.plan_id = b.plan_id
+	WHERE
+		a.platform_indicator_code IN ('R3','R4','DCE') 
+		AND b.category_type_code = 'PS'
+		AND cal_end_date >= a.begin_date
+		AND cal_end_date <= a.end_date
+		AND b.category_definition_brand_code = 'PRTC-STAT'
+		AND UPPER(participation_status_code) IN ('ACTIVE')
+		AND a.client_id =<<$pClientId>>
+	)
+	,PRSN_PLANSTAT_DIMN
+AS (
+	SELECT DISTINCT CLIENT_ID
+		,PLAN_ID
+		,platform_id
+		,PRSN_INTN_ID
+		,prtc_stat_cd
+		--,CAT_TYPE_CD
+		,MAX_PP_STAT_EFBEG_DT
+		,cal_end_date
+	FROM PRSN_PLANSTAT_DIMN01
+	WHERE MAX_PP_STAT_EFBEG_DT = PP_STAT_EFBEG_DT
+	)
+	,person_planstat
+AS (
+	SELECT p.global_client_id
+		,p.global_person_id
+		,p.client_id
+		,p.client_id_string
+		,d.platform_id
+		,p.platform_person_internal_id
+		,p.employment_status
+		,d.prtc_stat_cd
+		,d.plan_id
+		,p.row_level_security_filter_value
+		,d.cal_end_date
+	FROM prsn_planstat_dimn d
+	INNER JOIN mv_person_employment p ON p.client_id = d.client_id
+		AND p.platform_person_internal_id = d.prsn_intn_id
+		AND p.cal_end_date = d.cal_end_date
+		AND p.platform_id = d.platform_id
+	)
+	,dc_plan_dimn
+AS (
+	SELECT client_id
+		,plan_brand_code as plan_brnd_cd
+		,plan_long_description as plan_ldsc_tx
+		,plan_type_code as plan_type_cd
+		,plan_id
+	FROM wealth_rpt.dc_plan_dim
+	WHERE client_id =<<$pClientId>>
+		AND plan_type_code = 'DC'
+		AND plan_brand_code <> 'DC-NON-QLFY'
+	)
+	,person_data
+AS (
+	SELECT a.client_id
+		,a.client_id_string
+		,a.platform_person_internal_id
+		,a.employment_status
+		,a.prtc_stat_cd
+		,a.plan_id
+		,b.plan_ldsc_tx
+		,a.row_level_security_filter_value
+		,a.cal_end_date as reporting_month
+	FROM person_planstat a
+	INNER JOIN dc_plan_dimn b 
+		ON a.client_id = b.client_id
+		AND a.plan_id = b.plan_id
+	WHERE b.plan_type_cd = 'DC'
+	)
+,fund_asset_mapping AS (
+	SELECT
+		client_id,
+		plan_identifier,
+		fund_identifier,
+		asset_name,
+		asset_class_identifier,
+		cal_end_date AS reporting_month
+	FROM
+		wealth_rpt.dc_icb_fund_asset_mapping
+		CROSS JOIN calendar
+	WHERE client_id IN (<<$pClientId>>)
+		AND asset_class_identifier<>17
+		AND effective_begin_date <= cal_end_date
+		AND effective_end_date >= cal_end_date
+)
+   ,hard_balance_trnsfer_fund 
+as(
+	SELECT hb.client_id AS client_id,
+		hb.client_id_string AS client_id_string,
+		hb.plan_id AS plan_id,
+		hb.platform_person_internal_id,
+		last_day(accounting_activity_effective_date) as reporting_month,
+		SUM(CASE WHEN participant_intiated_transfer_in > 0 THEN 1 ELSE 0 END) AS ppt_transfer
+	FROM wealth_rpt.dc_hard_balance hb
+	INNER JOIN wealth_rpt.hardbalance_dim hdm 
+		ON hb.client_id = hdm.client_id
+		AND hb.plan_id = hdm.plan_id
+		AND hb.hard_balance_id = hdm.hardbalance_id
+		AND hb.fund_id = hdm.fund_id
+	INNER JOIN fund_asset_mapping asset
+		ON hdm.client_id = asset.client_id
+		AND hdm.fund_id = asset.fund_identifier
+		AND hdm.plan_id = asset.plan_identifier
+		AND LAST_DAY(hb.accounting_activity_effective_date) = asset.reporting_month
+	CROSS JOIN calendar
+	WHERE accounting_activity_effective_date BETWEEN cal_begin_date AND cal_end_date
+		AND hb.client_id = <<$pClientId>>	
+	GROUP BY 
+		hb.client_id,
+		hb.client_id_string,
+		hb.plan_id,
+		hb.platform_person_internal_id,
+		last_day(accounting_activity_effective_date)
+	)
+	,join_person_hard_balance
+AS(
+	SELECT 
+		a.client_id
+		,a.client_id_string
+		,a.platform_person_internal_id
+		,a.plan_id
+		,a.plan_ldsc_tx
+		,a.reporting_month
+		,b.ppt_transfer
+		,a.row_level_security_filter_value
+	FROM person_data a 
+		INNER JOIN hard_balance_trnsfer_fund b
+		ON a.client_id = b.client_id
+		AND a.plan_id = b.plan_id
+		AND a.platform_person_internal_id = b.platform_person_internal_id
+		AND a.reporting_month = b.reporting_month
+	)
+SELECT client_id,
+	client_id_string,
+	reporting_month,
+	row_level_security_filter_value,
+	COUNT(DISTINCT CASE WHEN ppt_transfer > 0 then platform_person_internal_id end) AS ppts_making_transfers
+FROM join_person_hard_balance
+GROUP BY client_id,
+	client_id_string,
+	reporting_month,
+	row_level_security_filter_value

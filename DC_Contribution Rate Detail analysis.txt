@@ -1,0 +1,184 @@
+WITH contributions AS (
+    SELECT 
+        cont.client_id,
+        cont.platform_id,
+        cont.platform_person_internal_id,
+        cont.plan_id,
+        contdm.contribution_rate_long_description AS contribution_election_description,
+        cont.begin_date,
+        cont.end_date,
+        cont.actual_contribution_rate,
+        AVG(cont.actual_contribution_amount) AS contribution_amount,
+        AVG(cont.auto_escalation_percent) AS contribution_escalation_annual_increase_rate,
+        AVG(cont.auto_escalation_target_percent) AS contribution_escalation_target_rate
+    FROM wealth_itg.dc_contributions cont
+    JOIN wealth_rpt.dc_contribution_dim contdm 
+        ON cont.contribution_rate_id = contdm.contribution_rate_id
+        AND cont.client_id = contdm.client_id
+    WHERE cont.client_id = CAST(<<$pClientId>> AS INT)
+      AND <<$pEndDate>> >= cont.begin_date
+      AND <<$pBeginDate>> <= cont.end_date
+
+    GROUP BY 
+        cont.client_id,
+        cont.platform_id,
+        cont.platform_person_internal_id,
+        cont.plan_id,
+        cont.begin_date,
+        cont.end_date,
+        cont.actual_contribution_rate,
+        contdm.contribution_rate_long_description
+),
+plan_status AS (
+    SELECT 
+        a.client_id,
+        a.platform_person_internal_id,
+        a.plan_id,
+        a.plan_status_description AS plan_status
+    FROM wealth_rpt.person_planstatus_dim a
+    JOIN wealth_rpt.dc_category_dim b 
+        ON a.client_id = b.client_id
+        AND a.category_id = b.category_id
+        AND a.plan_id = b.plan_id
+    WHERE a.client_id = CAST(<<$pClientId>> AS INT)
+      AND a.platform_indicator_code IN ('R3', 'R4', 'DCE')
+      AND b.category_type_code = 'PS'
+      AND b.category_definition_brand_code = 'PRTC-STAT'
+      AND <<$pEndDate>> >= a.begin_date
+      AND <<$pBeginDate>> <= a.end_date
+),
+plan_details AS (
+    SELECT 
+        client_id,
+        plan_id,
+        MAX(plan_long_description) AS plan_name
+    FROM wealth_rpt.hardbalance_dim
+    WHERE client_id = CAST(<<$pClientId>> AS INT)
+      AND plan_type_code = 'DC'
+    GROUP BY client_id, plan_id
+),
+main_query AS (
+    SELECT 
+        p.client_id,
+        p.client_id_string,
+        p.platform_person_internal_id AS platform_person_internal_id,
+		p.platform_id,
+        e.employee_id,
+        p.last_name,
+        p.first_name,
+        p.middle_name,
+        p.gender,
+        FLOOR(e.expected_annual_base_salary) AS salary,
+        FLOOR(DATEDIFF(day, p.birth_date, <<$pEndDate>>) / 365.25) AS age,
+        CASE 
+            WHEN p.person_reason_code = 'Employee' AND UPPER(standard_rollup.standard_value) = 'ACTIVE'
+                THEN ROUND(DATEDIFF(day, e.hire_date, <<$pEndDate>>) / 365.25, 2)
+            WHEN p.person_reason_code = 'Employee' AND UPPER(standard_rollup.standard_value) <> 'ACTIVE'
+                AND e.termination_date IS NOT NULL AND EXTRACT(YEAR FROM e.termination_date) <> 2299
+                THEN ROUND(DATEDIFF(day, e.hire_date, e.termination_date) / 365.25, 2)
+            ELSE NULL
+        END AS tenure,
+        p.person_reason_code AS person_type,
+        e.standard_employment_status as employment_status1,
+        standard_rollup.standard_value as employment_status,
+        e.employment_status_begin_date,
+        e.fulltime_parttime_status AS fulltime_parttime,
+        e.hourly_salary_status AS salary_hourly,
+        p.union_name,
+        pd.plan_name,
+        ps.plan_status,
+        c.contribution_election_description,
+        c.begin_date,
+        c.actual_contribution_rate,
+        c.contribution_amount,
+        c.contribution_escalation_annual_increase_rate,
+        c.contribution_escalation_target_rate,
+        sf.row_level_security_filter_value,
+        cf.custom_filter_1,
+        cf.custom_filter_2,
+        cf.custom_filter_3,
+        cf.custom_filter_4,
+        cf.custom_filter_5
+    FROM person_rpt.person p
+    JOIN person_rpt.person_employment e 
+        ON p.client_id = e.client_id
+        AND p.platform_id = e.platform_id
+        AND p.platform_person_internal_id = e.platform_person_internal_id
+	LEFT OUTER JOIN adlfound_itg.standard_rollups_lookup standard_rollup 
+		ON e.standard_employment_status_code = standard_rollup.standard_key
+		AND standard_group_key in ('EMPL-STAT-CD-ROLLUP1')
+		
+    LEFT JOIN person_itg.person_security_filter sf 
+        ON p.client_id = sf.client_id
+        AND p.platform_person_internal_id = sf.platform_person_internal_id
+    LEFT JOIN person_itg.person_custom_filter cf 
+        ON p.client_id = cf.client_id
+        AND p.platform_person_internal_id = cf.platform_person_internal_id
+        AND cf.data_product = 'DC'
+        AND <<$pEndDate>> <= cf.end_date 
+        AND <<$pEndDate>> >= cf.begin_date
+    LEFT JOIN contributions c 
+        ON p.client_id = c.client_id
+        AND p.platform_person_internal_id = c.platform_person_internal_id
+    LEFT JOIN plan_status ps 
+        ON ps.client_id = c.client_id 
+        AND ps.plan_id = c.plan_id 
+        AND ps.platform_person_internal_id = c.platform_person_internal_id
+    LEFT JOIN plan_details pd 
+        ON pd.client_id = c.client_id 
+        AND pd.plan_id = c.plan_id
+    WHERE p.client_id = CAST(<<$pClientId>> AS INT)
+      AND e.client_id = CAST(<<$pClientId>> AS INT)
+      AND <<$pEndDate>> BETWEEN p.begin_date AND p.end_date
+      AND <<$pEndDate>> BETWEEN e.begin_date AND e.end_date
+),
+main as
+(
+   SELECT 
+      mq.client_id,
+      mq.client_id_string,
+      mq.platform_person_internal_id,
+	  mq.platform_id,
+      mq.employee_id,
+      mq.last_name,
+      mq.first_name,
+      mq.middle_name,
+      mq.gender,
+      mq.salary,
+      mq.age,
+      mq.tenure,
+      mq.person_type,
+      mq.employment_status1 as employment_status,
+      mq.employment_status_begin_date,
+      mq.fulltime_parttime,
+      mq.salary_hourly,
+      mq.union_name,
+      mq.plan_name,
+      mq.plan_status,
+      mq.contribution_election_description,
+      mq.begin_date,
+      mq.actual_contribution_rate AS actual_contribution_rate,
+      mq.contribution_amount,
+      mq.contribution_escalation_annual_increase_rate,
+      mq.contribution_escalation_target_rate,
+      age_rg.standard_display_name AS age_range,
+      salary_rg.standard_display_name AS salary_range,
+      tenure_rg.standard_display_name AS employment_range,
+      mq.row_level_security_filter_value,
+      mq.custom_filter_1,
+      mq.custom_filter_2,
+      mq.custom_filter_3,
+      mq.custom_filter_4,
+      mq.custom_filter_5
+  FROM main_query mq
+  LEFT JOIN adlfound_itg.standard_ranges_lookup age_rg 
+      ON FLOOR(mq.age) BETWEEN (age_rg.standard_min) AND (age_rg.standard_max)
+      AND age_rg.standard_group_key = 'AGE_RANGE_DC'
+  LEFT JOIN adlfound_itg.standard_ranges_lookup tenure_rg 
+      ON FLOOR(mq.tenure) BETWEEN (tenure_rg.standard_min) AND (tenure_rg.standard_max)
+      AND tenure_rg.standard_group_key = 'TENURE'
+  LEFT JOIN adlfound_itg.standard_ranges_lookup salary_rg 
+      ON FLOOR(mq.salary) BETWEEN (salary_rg.standard_min) AND (salary_rg.standard_max) 
+      AND salary_rg.standard_group_key = 'SALARY_RANGE_WEALTH'
+)
+select * from main
