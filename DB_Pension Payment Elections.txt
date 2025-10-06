@@ -49,7 +49,7 @@ AS (
                                 ,expected_annual_base_salary
                                 ,hourly_salary_status
                                 ,fulltime_parttime_status
-                                ,employment_status
+                                ,standard_employment_status as employment_status
                                 ,hire_date
                                 , CASE WHEN termination_date IN ('1800-01-01','1900-01-01','0001-12-30 BC') THEN NULL ELSE termination_date end as termination_date
                                 ,begin_date as effective_begin_date
