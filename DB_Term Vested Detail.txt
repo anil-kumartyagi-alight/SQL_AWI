@@ -50,7 +50,7 @@ AS (
                                 ,expected_annual_base_salary
                                 ,hourly_salary_status
                                 ,fulltime_parttime_status
-                                ,employment_status
+                                ,standard_employment_status as employment_status
                                 ,hire_date
                                 ,termination_date
 								,employment_status_begin_date as effective_begin_date
