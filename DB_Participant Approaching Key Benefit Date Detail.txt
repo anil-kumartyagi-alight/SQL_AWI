@@ -49,8 +49,7 @@ AS (
                                 ,cast (coalesce (expected_annual_base_salary,0)  as numeric (19,4))  as expected_annual_base_salary
                                 ,hourly_salary_status
                                 ,fulltime_parttime_status
-                                ,employment_status
-                                ,standard_employment_status
+                                ,standard_employment_status as employment_status
                                 ,hire_date
                                 ,termination_date
                                 ,employment_status_begin_date as effective_begin_date
@@ -97,7 +96,7 @@ AS (
                                 ,p.LAST_NM
                                 ,p.birth_date
                                 ,case WHEN p.person_reason_code = 'Employee'
-                                  AND upper(e.standard_employment_status) <> 'ACTIVE'
+                                  AND upper(e.roll_up_1) <> 'ACTIVE'
                                   AND e.termination_date IS NOT NULL
                                   AND EXTRACT(YEAR FROM e.termination_date) <> 2299
                                    THEN e.termination_date else NULL END AS termination_date
@@ -257,8 +256,8 @@ case when is_deferred_vested then 'Y' else 'N' end as is_deferred_vested
     FROM
         wealth_rpt.db_person_plan DB_ELIG_A_FACT11 
     WHERE 
-       -- '2025-01-01' <= DB_ELIG_A_FACT11.end_date AND
-       --'2025-01-01' >= DB_ELIG_A_FACT11.begin_date	   and 
+       -- <<$pAsOfdate>> <= DB_ELIG_A_FACT11.end_date AND
+       --<<$pAsOfdate>> >= DB_ELIG_A_FACT11.begin_date	   and 
        DB_ELIG_A_FACT11.client_id=<<$pClientId>>
     )
     -- select * from Shortcut_to_Pension_Popu_Elig_Current_All
