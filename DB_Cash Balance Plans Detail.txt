@@ -22,7 +22,7 @@ WITH person_attributes as
             ELSE NULL
         END AS Tenure,
         person.person_reason_code AS Person_Type,
-        employee.employment_status AS Employment_Status,
+        employee.standard_employment_status AS Employment_Status,
         employee.employment_status_begin_date AS Employment_Status_Begin_Date,
         employee.fulltime_parttime_status AS FullTime_PartTime,
         employee.hourly_salary_status AS Salary_Hourly,
