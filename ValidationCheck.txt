@@ -1,5 +1,0 @@
-Field Name (Mandatory),Value Check
-global_client_id,
-platform_person_internal_id,
-global_client_id,
-platform_indicator ,"R3, R4, DCE or DBE"
