@@ -25,7 +25,7 @@ jobs:
 
     - name: Run SQL Lineage Script
       run: |
-        python .github/scripts/extract_sql_lineage.py "${{ github.event.inputs.query_pattern }}"
+        python scripts/extract_sql_lineage.py "${{ github.event.inputs.query_pattern }}"
 
     - name: Upload HTML report
       uses: actions/upload-artifact@v4
