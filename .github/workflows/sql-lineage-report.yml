@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       query_pattern:
-        description: 'Glob pattern to match SQL files (e.g., sql/*.sql)'
+        description: 'Glob pattern to match SQL files (e.g., *.sql for root, scripts/*.sql if they are inside scripts/ folder)'
         required: true
-        default: 'sql/*.sql'
+        default: '*.sql'
 
 jobs:
   lineage-report:
