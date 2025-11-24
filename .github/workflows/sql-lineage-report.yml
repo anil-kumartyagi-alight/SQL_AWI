@@ -28,7 +28,7 @@ jobs:
         python .github/scripts/extract_sql_lineage.py "${{ github.event.inputs.query_pattern }}"
 
     - name: Upload HTML report
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: sql-lineage-report
         path: sql_lineage_report.html
