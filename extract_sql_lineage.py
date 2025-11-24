@@ -2,8 +2,8 @@ import os
 import glob
 import sys
 import sqlparse
-from sqlparse.sql import IdentifierList, Identifier, Token
-from sqlparse.tokens import Keyword, DML
+from sqlparse.sql import Identifier
+from sqlparse.tokens import Keyword
 from graphviz import Digraph
 
 def extract_tables_and_joins(sql):
