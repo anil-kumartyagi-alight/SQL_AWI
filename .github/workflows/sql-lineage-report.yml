@@ -1,34 +1,28 @@
 name: SQL Lineage Report
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      query_pattern:
-        description: 'Glob pattern to match SQL files (e.g., *.sql for root, scripts/*.sql if they are inside scripts/ folder)'
-        required: true
-        default: '*.sql'
 
 jobs:
-  lineage-report:
+  build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.x'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
 
-    - name: Install dependencies
-      run: |
-        pip install sqlparse graphviz
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install networkx matplotlib sqlparse
 
-    - name: Run SQL Lineage Script
-      run: |
-        python scripts/extract_sql_lineage.py "${{ github.event.inputs.query_pattern }}"
-
-    - name: Upload HTML report
-      uses: actions/upload-artifact@v4
-      with:
-        name: sql-lineage-report
-        path: sql_lineage_report.html
+      - name: Run SQL lineage script
+        run: python scripts/extract_sql_lineage.py "sql/*.sql"
