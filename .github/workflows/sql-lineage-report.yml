@@ -1,4 +1,4 @@
-name: SQL Lineage Report
+name: SQL Lineage Per SQL File
 
 on:
   push:
@@ -24,5 +24,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install networkx matplotlib sqlparse
 
-      - name: Run SQL lineage script
-        run: python scripts/extract_sql_lineage.py "sql/*.sql"
+      - name: Run lineage for each .sql file
+        run: python scripts/extract_lineage_per_file.py
+
+      - name: Upload all lineage reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: sql-lineage-per-file
+          path: |
+            *.png
+            *_lineage.html
