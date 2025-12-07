@@ -1,4 +1,4 @@
-name: SQL Column Lineage Report
+name: SQL Table Lineage Extraction
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  column-lineage:
+  table-lineage:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -22,13 +22,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install sqlparse
+          pip install sqllineage
 
-      - name: Run column lineage extraction
-        run: python scripts/extract_column_lineage.py
+      - name: Run sqllineage extraction
+        run: python scripts/advanced_lineage.py
 
       - name: Upload lineage CSV
         uses: actions/upload-artifact@v4
         with:
-          name: sql-column-lineage-csv
-          path: sql_column_lineage.csv
+          name: sql-table-lineage
+          path: sql_table_lineage.csv
