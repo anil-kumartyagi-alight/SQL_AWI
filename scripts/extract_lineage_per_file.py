@@ -1,37 +1,39 @@
 import os
 import glob
+import re
 import sqlparse
-from sqlparse.sql import Identifier
-from sqlparse.tokens import Keyword
 import networkx as nx
 import matplotlib.pyplot as plt
 
 def extract_tables_and_joins(sql):
-    parsed = sqlparse.parse(sql)
-    tables, joins = set(), []
+    """
+    Extracts table names (including schema.qualified) used in FROM and JOIN clauses in SQL,
+    including CTEs and subqueries, using regex heuristics.
+    Returns:
+        tables: set of table names
+        joins: list of (left_table, right_table)
+    """
+    # Pattern captures tables after FROM or JOIN (optionally schema.qualified), until a whitespace or bracket/comma/semicolon
+    from_join_pattern = re.compile(r'\b(?:FROM|JOIN)\s+([a-zA-Z0-9_\.]+)', re.IGNORECASE)
+    tables = set()
+    joins = []
     last_from = None
-    for stmt in parsed:
-        tokens = list(stmt.flatten())
-        for i, token in enumerate(tokens):
-            if token.ttype is Keyword and token.value.upper() in ('FROM', 'JOIN'):
-                # Look for next identifier as the table name
-                j = i + 1
-                while j < len(tokens) and not isinstance(tokens[j], Identifier):
-                    j += 1
-                if j < len(tokens):
-                    tb_name = str(tokens[j])
-                    tables.add(tb_name)
-                    if token.value.upper() == 'JOIN' and last_from:
-                        joins.append((last_from, tb_name))
-                if token.value.upper() == 'FROM' and j < len(tokens):
-                    last_from = str(tokens[j])
+    for match in from_join_pattern.finditer(sql):
+        table = match.group(1)
+        tables.add(table)
+        # Determine if this is a FROM or JOIN by looking at the pattern
+        keyword = sql[max(0, match.start()-5):match.start()].strip().upper()
+        if keyword.endswith('FROM'):
+            last_from = table
+        elif keyword.endswith('JOIN') and last_from is not None:
+            joins.append((last_from, table))
     return tables, joins
 
 def generate_graph(file_base, tables, joins):
     G = nx.DiGraph()
     G.add_nodes_from(tables)
     G.add_edges_from(joins)
-    plt.figure(figsize=(8, 5))
+    plt.figure(figsize=(max(8, len(tables)), 5))
     pos = nx.spring_layout(G, k=0.6, seed=42)
     nx.draw(G, pos, with_labels=True, node_color='skyblue',
             node_size=1700, edge_color='gray', font_size=10, arrows=True)
@@ -51,7 +53,7 @@ def generate_html_report(file, tables, joins, image_path):
       <h1>SQL Lineage for {file}</h1>
       <img src="{os.path.basename(image_path)}" alt="SQL Lineage Graph" width="700"/><br/>
       <h2>Tables</h2>
-      <ul>{''.join(f'<li>{tbl}</li>' for tbl in tables)}</ul>
+      <ul>{''.join(f'<li>{tbl}</li>' for tbl in sorted(tables))}</ul>
       <h2>Joins</h2>
       <ul>{''.join(f'<li>{a} → {b}</li>' for a, b in joins)}</ul>
     </body>
@@ -72,6 +74,8 @@ if __name__ == "__main__":
         with open(file, 'r', encoding='utf-8') as f:
             sql = f.read()
         tables, joins = extract_tables_and_joins(sql)
+        print(f"Tables found in {file}: {tables}")
+        print(f"Joins found in {file}: {joins}")
         base = os.path.splitext(file)[0]
         img = generate_graph(base, tables, joins)
         html = generate_html_report(file, tables, joins, img)
