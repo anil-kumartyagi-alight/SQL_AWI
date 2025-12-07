@@ -1,14 +1,14 @@
-name: Extract SQL Metadata
+name: Advanced SQL Lineage Extraction
 
 on:
   push:
     paths:
       - '**.sql'
-      - 'scripts/extract_sql_metadata.py'
+      - 'scripts/advanced_sql_lineage.py'
   workflow_dispatch:
 
 jobs:
-  extract-metadata:
+  extract-lineage:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -19,11 +19,11 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Run SQL metadata extraction
-        run: python scripts/extract_sql_metadata.py
+      - name: Run advanced SQL lineage extraction
+        run: python scripts/advanced_sql_lineage.py
 
-      - name: Upload metadata artifact
+      - name: Upload lineage artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sql_metadata
+          name: sql_lineage
           path: sql_metadata.csv
