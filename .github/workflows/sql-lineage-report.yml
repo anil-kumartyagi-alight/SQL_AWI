@@ -28,7 +28,7 @@ jobs:
         run: python scripts/extract_lineage_per_file.py
 
       - name: Upload all lineage reports
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: sql-lineage-per-file
           path: |
