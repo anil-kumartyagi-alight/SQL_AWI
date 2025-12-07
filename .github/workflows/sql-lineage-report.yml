@@ -1,34 +1,29 @@
-name: SQL Table Lineage Extraction
+name: Extract SQL Metadata
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    paths:
+      - '**.sql'
+      - 'scripts/extract_sql_metadata.py'
   workflow_dispatch:
 
 jobs:
-  table-lineage:
+  extract-metadata:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install sqllineage
+      - name: Run SQL metadata extraction
+        run: python scripts/extract_sql_metadata.py
 
-      - name: Run sqllineage extraction
-        run: python scripts/advanced_lineage.py
-
-      - name: Upload lineage CSV
+      - name: Upload metadata artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sql-table-lineage
-          path: sql_table_lineage.csv
+          name: sql_metadata
+          path: sql_metadata.csv
