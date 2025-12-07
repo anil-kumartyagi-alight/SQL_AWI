@@ -10,9 +10,9 @@ def lineage_csv(sql_files, out_csv="sql_table_lineage.csv"):
             with open(file, "r", encoding="utf-8") as f:
                 sql = f.read()
             runner = LineageRunner(sql)
-            sources = [str(s) for s in runner.source_tables]
-            targets = [str(t) for t in runner.target_tables]
-            writer.writerow([file, ",".join(sources), ",".join(targets)])
+            sources = ",".join([str(s) for s in runner.source_tables])
+            targets = ",".join([str(t) for t in runner.target_tables])
+            writer.writerow([file, sources, targets])
     print(f"Table lineage written to {out_csv}")
 
 if __name__ == "__main__":
