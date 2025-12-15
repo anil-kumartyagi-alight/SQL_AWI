@@ -2,68 +2,104 @@ import os
 import re
 import csv
 
-def find_sql_files(root_dir):
-    sql_files = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for file in filenames:
-            if file.endswith('.sql'):
-                sql_files.append(os.path.join(dirpath, file))
-    return sql_files
+# ... your existing functions ...
 
-def extract_select_fields(select_clause):
-    fields = []
-    # Split by comma, keep AS aliases, remove trailing/leading whitespace
-    for col in re.split(r",(?=(?:[^']*'[^']*')*[^']*$)", select_clause, flags=re.DOTALL):
-        col = col.strip()
-        # Get the field/alias name
-        match = re.match(r".*?\s+AS\s+([^\s,]+)", col, re.IGNORECASE)
-        if match:
-            fields.append(match.group(1))
-        else:
-            # Try bare field name (may have function, table.field)
-            simple = col.split(".")[-1].split()[-1].replace(",", "")
-            if simple:
-                fields.append(simple)
-    return fields
+def extract_where_filters(sql_text):
+    """
+    Extract field and filter expression from WHERE clauses.
+    Returns: list of dicts: {table, field, filter_condition, filter_type}
+    """
+    filters = []
+    # Basic: Find WHERE ... (until GROUP|ORDER|HAVING|UNION|END)
+    for where in re.finditer(r'WHERE\s+(.*?)(GROUP\s+BY|ORDER\s+BY|HAVING|UNION|$)', sql_text, re.IGNORECASE|re.DOTALL):
+        cond_block = where.group(1)
+        # Split by AND/OR, crude but common patterns
+        conditions = re.split(r'\bAND\b|\bOR\b', cond_block, flags=re.IGNORECASE)
+        for cond in conditions:
+            cond = cond.strip()
+            # Try to extract (table.)field
+            match = re.match(r'([a-zA-Z0-9_\.]+)\s*(=|<>|!=|>|<|>=|<=|IN|LIKE|IS)\s*.+', cond)
+            if match:
+                fld = match.group(1)
+                schema, table, field = '', '', fld
+                if '.' in fld:
+                    parts = fld.split('.')
+                    if len(parts) == 2:
+                        table, field = parts
+                    elif len(parts) == 3:
+                        schema, table, field = parts
+                filters.append({
+                    'filter_type': 'WHERE',
+                    'schema': schema,
+                    'table': table,
+                    'field': field,
+                    'filter_condition': cond,
+                    'join_table': ''
+                })
+    return filters
 
-def extract_tables(sql_block):
-    # FROM/JOIN target extraction (handles schema)
-    table_regex = re.compile(r"(?:FROM|JOIN)\s+([a-zA-Z0-9_\.]+)", re.IGNORECASE)
-    tables = []
-    for match in table_regex.finditer(sql_block):
-        tbl = match.group(1)
-        if "." in tbl:
-            schema, table = tbl.split(".", 1)
-        else:
-            schema, table = "", tbl
-        tables.append((schema, table))
-    return tables
-
-def extract_ctes(sql_text):
-    # Extract CTE blocks from WITH ... AS ( ... )
-    cte_blocks = []
-    with_start = sql_text.find("WITH ")
-    if with_start == -1:
-        return []
-    sql_after_with = sql_text[with_start+5:]
-    # Match cte_name AS ( ... ) pairs
-    pattern = re.compile(r"(\w+)\s+AS\s*\((.*?)\)(,|WITH|SELECT|INSERT|UPDATE|DELETE|$)", re.DOTALL | re.IGNORECASE)
-    for m in pattern.finditer(sql_after_with):
-        name, cte_content, _ = m.groups()
-        cte_blocks.append((name.strip(), cte_content.strip()))
-    return cte_blocks
-
-def extract_main_select(sql_text):
-    # Find outermost SELECT ... FROM ...
-    select_match = re.search(r"SELECT\s+(.*?)\s+FROM\s+([a-zA-Z0-9_\.]+)", sql_text, re.DOTALL | re.IGNORECASE)
-    if select_match:
-        fields = extract_select_fields(select_match.group(1))
-        tbl = select_match.group(2)
-        schema, table = ("", tbl)
-        if "." in tbl:
-            schema, table = tbl.split(".", 1)
-        return [{"schema": schema, "table": table, "field": field} for field in fields]
-    return []
+def extract_join_filters(sql_text):
+    """
+    Extract field, filter expression, join table from JOIN ... ON ... clauses.
+    Returns: list of dicts: {table, field, filter_condition, filter_type, join_table}
+    """
+    filters = []
+    # Find all JOIN ... ON ... (stop at next JOIN/WHERE)
+    join_pattern = re.compile(
+        r'(JOIN)\s+([a-zA-Z0-9_\.]+).*?ON\s+([^\n;]*?)(?:\s+JOIN|\s+WHERE|GROUP\s+BY|ORDER\s+BY|$)',
+        re.IGNORECASE|re.DOTALL
+    )
+    for m in join_pattern.finditer(sql_text):
+        join_table_full = m.group(2)
+        on_expr = m.group(3)
+        join_schema, join_table = '', join_table_full
+        if "." in join_table_full:
+            parts = join_table_full.split('.')
+            if len(parts) == 2:
+                join_schema, join_table = parts
+        # Each condition (split by AND/OR)
+        for cond in re.split(r'\bAND\b|\bOR\b', on_expr, flags=re.IGNORECASE):
+            cond = cond.strip()
+            # Extract both sides of equality
+            eq_match = re.match(r'([a-zA-Z0-9_\.]+)\s*=\s*([a-zA-Z0-9_\.]+)', cond)
+            if eq_match:
+                for fld in [eq_match.group(1), eq_match.group(2)]:
+                    schema, table, field = '', '', fld
+                    if '.' in fld:
+                        parts = fld.split('.')
+                        if len(parts) == 2:
+                            table, field = parts
+                        elif len(parts) == 3:
+                            schema, table, field = parts
+                    filters.append({
+                        'filter_type': 'JOIN_ON',
+                        'schema': schema,
+                        'table': table,
+                        'field': field,
+                        'filter_condition': cond,
+                        'join_table': join_table
+                    })
+            else:
+                # Handle more complex ON conditions
+                fld_match = re.match(r'([a-zA-Z0-9_\.]+)', cond)
+                if fld_match:
+                    fld = fld_match.group(1)
+                    schema, table, field = '', '', fld
+                    if '.' in fld:
+                        parts = fld.split('.')
+                        if len(parts) == 2:
+                            table, field = parts
+                        elif len(parts) == 3:
+                            schema, table, field = parts
+                    filters.append({
+                        'filter_type': 'JOIN_ON',
+                        'schema': schema,
+                        'table': table,
+                        'field': field,
+                        'filter_condition': cond,
+                        'join_table': join_table
+                    })
+    return filters
 
 def process_sql_text(sql_text, filename):
     results = []
@@ -88,7 +124,7 @@ def process_sql_text(sql_text, filename):
     for schema, table in extract_tables(sql_text):
         results.append({'file': filename, 'schema': schema, 'table': table, 'field': ''})
 
-    # 3. Extra: try to find all SELECT ... FROM ... deep inside (for subqueries)
+    # 3. Extra: find all SELECT ... FROM ... deep inside (for subqueries)
     for sub_select in re.finditer(r"SELECT\s+(.*?)\s+FROM\s+([a-zA-Z0-9_\.]+)", sql_text, re.DOTALL | re.IGNORECASE):
         select_clause = sub_select.group(1)
         table_full = sub_select.group(2)
@@ -99,20 +135,31 @@ def process_sql_text(sql_text, filename):
         for f in fields:
             results.append({'file': filename, 'schema': schema, 'table': table, 'field': f})
 
-    return results
+    # 4. Extract predefined filters in WHERE/ON
+    filter_results = []
+    for f in extract_where_filters(sql_text):
+        f['file'] = filename
+        filter_results.append(f)
+    for f in extract_join_filters(sql_text):
+        f['file'] = filename
+        filter_results.append(f)
+
+    return results, filter_results
 
 def main():
     repo_root = os.path.abspath(os.path.dirname(__file__) + '/../')
     sql_files = find_sql_files(repo_root)
     print(f"SQL files found: {sql_files}")
     all_results = []
+    all_filters = []
     for sql_file in sql_files:
         with open(sql_file, 'r', encoding='utf-8', errors='ignore') as f:
             sql_text = f.read()
-            rows = process_sql_text(sql_text, os.path.relpath(sql_file, repo_root))
-            print(f"{sql_file}: Found {len(rows)} lineage records.")
+            rows, filters = process_sql_text(sql_text, os.path.relpath(sql_file, repo_root))
+            print(f"{sql_file}: Found {len(rows)} lineage records, {len(filters)} filter records.")
             all_results.extend(rows)
-    # Deduplicate records
+            all_filters.extend(filters)
+    # Deduplicate lineage records
     seen = set()
     deduped = []
     for row in all_results:
@@ -120,13 +167,28 @@ def main():
         if k not in seen:
             seen.add(k)
             deduped.append(row)
+    # Deduplicate filter records
+    seen_filters = set()
+    deduped_filters = []
+    for row in all_filters:
+        k = tuple(sorted(row.items()))
+        if k not in seen_filters:
+            seen_filters.add(k)
+            deduped_filters.append(row)
     out_file = os.path.join(repo_root, 'sql_metadata.csv')
     with open(out_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=['file','schema','table','field'])
         writer.writeheader()
         for row in deduped:
             writer.writerow(row)
+    filter_file = os.path.join(repo_root, 'sql_filters.csv')
+    with open(filter_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['file','filter_type','schema','table','field','filter_condition','join_table'])
+        writer.writeheader()
+        for row in deduped_filters:
+            writer.writerow(row)
     print(f"Wrote {len(deduped)} rows to {out_file}")
+    print(f"Wrote {len(deduped_filters)} filter rows to {filter_file}")
 
 if __name__ == "__main__":
     main()
