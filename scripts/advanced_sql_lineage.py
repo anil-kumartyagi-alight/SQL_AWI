@@ -2,7 +2,66 @@ import os
 import re
 import csv
 
-# ... your existing functions ...
+def find_sql_files(directory):
+    """
+    Recursively find all .sql files in the given directory.
+    Returns a list of file paths.
+    """
+    sql_files = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith('.sql'):
+                sql_files.append(os.path.join(root, file))
+    return sql_files
+
+# Placeholder for missing SQL helpers referenced in main script
+def extract_ctes(sql_text):
+    """Extract CTE name and SQL as a list of (name, sql) tuples."""
+    pattern = re.compile(r"WITH\s+([a-zA-Z0-9_]+)\s+AS\s*\((.*?)\)\s*(,|WITH|SELECT|$)", re.DOTALL|re.IGNORECASE)
+    ctes = []
+    for match in pattern.finditer(sql_text):
+        ctes.append((match.group(1), match.group(2)))
+    return ctes
+
+def extract_main_select(sql_text):
+    """Extract SELECT fields, as [{'schema':..., 'table':..., 'field':...}]"""
+    # This is simplified and might need to be adapted for complex SQL.
+    results = []
+    select_match = re.search(r"SELECT\s+(.*?)\s+FROM\s+([a-zA-Z0-9_\.]+)", sql_text, re.DOTALL | re.IGNORECASE)
+    if select_match:
+        select_clause = select_match.group(1)
+        table_full = select_match.group(2)
+        fields = extract_select_fields(select_clause)
+        schema, table = ("", table_full)
+        if "." in table_full:
+            schema, table = table_full.split(".", 1)
+        for f in fields:
+            results.append({'schema': schema, 'table': table, 'field': f})
+    return results
+
+def extract_select_fields(select_clause):
+    """Splits the select clause into fields (simplified, does not handle all cases)."""
+    fields = []
+    for f in select_clause.split(","):
+        f = f.strip()
+        # Remove aliases if present
+        field = f.split(" as ")[0].split(" AS ")[0].strip()
+        fields.append(field)
+    return fields
+
+def extract_tables(sql_text):
+    """
+    Extract (schema, table) pairs from all FROM/JOIN clauses.
+    Returns a set of (schema, table)
+    """
+    tables = set()
+    for m in re.finditer(r'(FROM|JOIN)\s+([a-zA-Z0-9_\.]+)', sql_text, re.IGNORECASE):
+        table_full = m.group(2)
+        schema, table = ("", table_full)
+        if "." in table_full:
+            schema, table = table_full.split(".", 1)
+        tables.add((schema, table))
+    return tables
 
 def extract_where_filters(sql_text):
     """
