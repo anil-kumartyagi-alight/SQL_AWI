@@ -22,8 +22,10 @@ jobs:
       - name: Run advanced SQL lineage extraction
         run: python scripts/advanced_sql_lineage.py
 
-      - name: Upload lineage artifact
+      - name: Upload lineage artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sql_lineage
-          path: sql_metadata.csv
+          path: |
+            sql_metadata.csv
+            sql_filters.csv
